@@ -1876,11 +1876,7 @@ struct StatusOverlay: View {
             case .cameraCalibration:
                 cameraCalibrationPanelContent
             case .cloudStorageDebug:
-                if CloudStorageSettings.isEnabled {
-                    cloudStorageDebugPanelContent
-                } else {
-                    Text("Recordings are saved on this device.")
-                }
+                cloudStorageDebugPanelContent
             case .visualizations:
                 visualizationsPanelContent
             case .handTracking:
@@ -2473,50 +2469,48 @@ struct StatusOverlay: View {
                                 recordingManager.storageLocation = .local
                             }
                             
-                            if CloudStorageSettings.isEnabled {
-                                storageOptionRow(
-                                    icon: "icloud.fill",
-                                    label: "iCloud Drive",
-                                    description: "Sync across your Apple devices",
-                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .iCloudDrive,
-                                    color: .blue
-                                ) {
-                                    recordingManager.storageLocation = .cloud
-                                    recordingManager.cloudProvider = .iCloudDrive
-                                    KeychainManager.shared.save(CloudStorageProvider.iCloudDrive.rawValue, forKey: .selectedCloudProvider)
-                                }
+                            storageOptionRow(
+                                icon: "icloud.fill",
+                                label: "iCloud Drive",
+                                description: "Sync across your Apple devices",
+                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .iCloudDrive,
+                                color: .blue
+                            ) {
+                                recordingManager.storageLocation = .cloud
+                                recordingManager.cloudProvider = .iCloudDrive
+                                KeychainManager.shared.save(CloudStorageProvider.iCloudDrive.rawValue, forKey: .selectedCloudProvider)
+                            }
 
-                                storageOptionRow(
-                                    icon: "g.circle.fill",
-                                    label: "Google Drive",
-                                    description: cloudStorageSettings.isGoogleDriveAvailable ? "Upload to your Google account" : "Sign in required",
-                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive,
-                                    color: Color(red: 0.26, green: 0.52, blue: 0.96),
-                                    showWarning: !cloudStorageSettings.isGoogleDriveAvailable
-                                ) {
-                                    recordingManager.storageLocation = .cloud
-                                    recordingManager.cloudProvider = .googleDrive
-                                    KeychainManager.shared.save(CloudStorageProvider.googleDrive.rawValue, forKey: .selectedCloudProvider)
-                                }
+                            storageOptionRow(
+                                icon: "g.circle.fill",
+                                label: "Google Drive",
+                                description: cloudStorageSettings.isGoogleDriveAvailable ? "Upload to your Google account" : "Sign in required",
+                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive,
+                                color: Color(red: 0.26, green: 0.52, blue: 0.96),
+                                showWarning: !cloudStorageSettings.isGoogleDriveAvailable
+                            ) {
+                                recordingManager.storageLocation = .cloud
+                                recordingManager.cloudProvider = .googleDrive
+                                KeychainManager.shared.save(CloudStorageProvider.googleDrive.rawValue, forKey: .selectedCloudProvider)
+                            }
 
-                                storageOptionRow(
-                                    icon: "shippingbox.fill",
-                                    label: "Dropbox",
-                                    description: cloudStorageSettings.isDropboxAvailable ? "Upload to your Dropbox account" : "Sign in required",
-                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .dropbox,
-                                    color: Color(red: 0, green: 0.4, blue: 1),
-                                    showWarning: !cloudStorageSettings.isDropboxAvailable
-                                ) {
-                                    recordingManager.storageLocation = .cloud
-                                    recordingManager.cloudProvider = .dropbox
-                                    KeychainManager.shared.save(CloudStorageProvider.dropbox.rawValue, forKey: .selectedCloudProvider)
-                                }
+                            storageOptionRow(
+                                icon: "shippingbox.fill",
+                                label: "Dropbox",
+                                description: cloudStorageSettings.isDropboxAvailable ? "Upload to your Dropbox account" : "Sign in required",
+                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .dropbox,
+                                color: Color(red: 0, green: 0.4, blue: 1),
+                                showWarning: !cloudStorageSettings.isDropboxAvailable
+                            ) {
+                                recordingManager.storageLocation = .cloud
+                                recordingManager.cloudProvider = .dropbox
+                                KeychainManager.shared.save(CloudStorageProvider.dropbox.rawValue, forKey: .selectedCloudProvider)
                             }
                         }
                     }
                     
                     // Sign-in prompt for Google Drive
-                    if CloudStorageSettings.isEnabled && recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive && !cloudStorageSettings.isGoogleDriveAvailable {
+                    if recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive && !cloudStorageSettings.isGoogleDriveAvailable {
                         Button {
                             expandedPanel = .none
                             isMinimized = true

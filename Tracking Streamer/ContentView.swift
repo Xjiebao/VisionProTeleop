@@ -175,11 +175,6 @@ struct ContentView: View {
     
     /// Handle START button press - determines which onboarding flow to show
     private func handleStartButton() {
-        guard CloudStorageSettings.isEnabled else {
-            proceedToImmersiveSpace()
-            return
-        }
-
         // No cloud storage configured - show sign-in prompt unless user opted out
         if !isCloudStorageConfigured {
             if !dontShowSignInAgain {

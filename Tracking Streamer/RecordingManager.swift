@@ -410,8 +410,7 @@ class RecordingManager: ObservableObject {
     
     private init() {
         // Load saved storage location
-        if CloudStorageSettings.isEnabled,
-           let savedLocation = UserDefaults.standard.string(forKey: "recordingStorageLocation"),
+        if let savedLocation = UserDefaults.standard.string(forKey: "recordingStorageLocation"),
            let location = RecordingStorageLocation(rawValue: savedLocation) {
             self.storageLocation = location
         } else {
@@ -441,10 +440,10 @@ class RecordingManager: ObservableObject {
         UserDefaults.standard.set(storageLocation.rawValue, forKey: "recordingStorageLocation")
         
         // Load cloud provider from keychain (synced from iOS)
-        if CloudStorageSettings.isEnabled {
-            loadCloudSettings()
-            setupCloudSettingsObserver()
-        }
+        loadCloudSettings()
+
+        // Observe cloud settings changes
+        setupCloudSettingsObserver()
     }
     
     /// Setup observer for cloud settings changes (from iCloud Keychain sync)
@@ -461,7 +460,6 @@ class RecordingManager: ObservableObject {
     
     /// Load cloud storage settings from iCloud Keychain (set by iOS companion app)
     func loadCloudSettings() {
-        guard CloudStorageSettings.isEnabled else { return }
         CloudStorageSettings.shared.loadSettings()
         cloudProvider = CloudStorageSettings.shared.getActiveProvider()
         // dlog("☁️ [RecordingManager] Cloud provider: \(cloudProvider.displayName)")
@@ -1790,7 +1788,7 @@ class RecordingManager: ObservableObject {
             
             dlog("✅ [RecordingManager] Recording saved successfully to: \(recordingFolder.path)")
             
-            if CloudStorageSettings.isEnabled && storageLocation == .cloud {
+            if storageLocation == .cloud {
                 await uploadToCloudIfNeeded(recordingFolder: recordingFolder)
             }
             

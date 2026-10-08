@@ -45,8 +45,6 @@ enum CloudStorageProvider: String, CaseIterable, Codable, Identifiable {
 /// Reads cloud storage settings from iCloud Keychain (set by iOS companion app)
 @MainActor
 class CloudStorageSettings: ObservableObject {
-    // Cloud integrations remain enabled by default.
-    static let isEnabled = true
     static let shared = CloudStorageSettings()
     
     // MARK: - Published Properties
@@ -61,7 +59,6 @@ class CloudStorageSettings: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     
     private init() {
-        guard Self.isEnabled else { return }
         loadSettings()
         setupForegroundObserver()
     }
@@ -93,7 +90,6 @@ class CloudStorageSettings: ObservableObject {
     
     /// Reload settings from keychain (call when app comes to foreground)
     func loadSettings() {
-        guard Self.isEnabled else { return }
         // dlog("☁️ [CloudStorageSettings] ==========================================")
         // dlog("☁️ [CloudStorageSettings] Loading settings from iCloud Keychain...")
         
