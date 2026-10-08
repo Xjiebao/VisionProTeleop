@@ -19,6 +19,58 @@ VisionProTeleop
 
 A complete ecosystem for using Apple Vision Pro in robotics research — from **real-world teleoperation** to **simulation teleoperation** to **egocentric dataset recording**. Stream hand/head tracking from Vision Pro, send video/audio/simulation back, and record everything to the cloud.
 
+## Ego 数据采集扩展：开发板与 Vision Pro
+
+本仓库基于 [Improbable-AI/VisionProTeleop](https://github.com/Improbable-AI/VisionProTeleop)，是对上游 Ego 数据采集方案的进一步延伸。上游的遥操作、视频／仿真串流、Ego 录制及相机标定能力保留其原有署名；本扩展主要解决外置双目相机与 Vision Pro 的独立采集、时间关联及空间标定问题。
+
+由于 Apple 未开放本方案所需的 Vision Pro 相机访问接口，我们沿用了上游的外接相机支架方案。为避免依赖价格较高的 Vision Pro Developer Strap，外置相机改由 Linux 开发板连接和录像，Vision Pro 负责记录头部与双手位姿，两端通过时钟测量建立时间关联。因此，本项目包含 Vision Pro 应用与 `board/` 中的开发板程序两部分。
+
+完成下述初始配置后，只要两台设备连接同一个可互访的局域网，Vision Pro 应用即可通过 Bonjour 自动发现开发板；发现一块时自动选择，多块时可手动选择。用户可以完全在 Vision Pro 上完成对钟、开始／结束视频录制、确认保存／作废，以及请求、检查和启用新的外参标定结果。无需在每轮采集时操作开发板终端。
+
+### 本扩展增加了什么
+
+- **独立的 Ego 位姿记录**：直接保存 ARKit 手部更新与头部查询结果，不从遥操作的预测姿态缓存取样；保留头、手、逐关节跟踪状态及时间信息，供后续与相机视频关联。
+- **双设备采集流程**：自动发现开发板，绑定同一采集编号，执行录前／录后对钟、开始／结束录像、保存／作废确认与 VP 原件传输。作废仅标记，不删除已有文件。
+- **相机—Vision Pro 外参标定**：补充本采集方案所需的外参求解代码、静态 VP 位姿采样，以及在 VP 操作的双目预览和连续录像标定流程。输出 `T_left_from_vp`、`T_right_from_vp`，满足 `p_camera = T_camera_from_vp @ p_vp`，长度单位为米；其中 VP 系为设备坐标系。
+- **录制界面与生命周期改进**：缩小界面只保留展开入口，停止、退出及重试在展开后操作，减少误触；补充采集状态、空间告警和未完成文件传输的恢复。
+
+### 安装与首次标定
+
+1. 用 Xcode 打开 `Tracking Streamer.xcodeproj`，选择 `VisionProTeleop` scheme，将签名团队和 Bundle Identifier 设置为自己的配置，在 Vision Pro 上构建并运行。上游 App Store 版本不包含本仓库新增的采集板控制功能。允许手部跟踪、世界感知和本地网络访问。
+2. 将 `board/` 复制到 Linux 开发板。环境需要 Python 3.9–3.12、V4L2、FFmpeg 开发库和 Avahi；`requirements-ego.txt` 锁定 Python 依赖。Debian／Ubuntu 可按下面准备：
+
+   ```bash
+   sudo apt install g++ pkg-config ffmpeg libavformat-dev libavcodec-dev libavutil-dev python3-virtualenv avahi-daemon
+   cd board
+   ./setup_ego.command
+   cp ego_config.example.json ego_config.json
+   ```
+
+3. 提供当前双目相机的真实内参、畸变及双目变换，保存为 `board/calibration/stereo_calibration.json`。当前代码适配固定的 4000×1200 MJPEG 原始画面：160 像素码带、1920 像素佩戴者右眼、1920 像素佩戴者左眼；不能直接用于任意双目相机。更换相机或图像布局时，需要相应修改采集及裁剪代码。
+4. **首次没有外参时，先做静态标定**：固定棋盘与 VP—相机安装关系，在 VP 的“位姿采样”保存并导出 `poses.json`，在同一静止姿态人工拍摄同编号左右眼照片。照片命名为 `001_left.png`、`001_right.png` 等；使用不同旋转和位置，并留出验证样本。初始外参求解不依赖旧外参。以下命令从仓库根目录执行，路径及棋盘规格按实际采集修改：
+
+   ```bash
+   board/.venv/bin/python board/ego_extrinsics.py solve \
+     --intrinsics board/calibration/stereo_calibration.json \
+     --poses /path/to/poses.json --images /path/to/images \
+     --output board/calibration/ego_extrinsics.json \
+     --cols 11 --rows 8 --square-mm 30 --validation-ids 021,022,023
+   ```
+
+5. 检查标定结果，将真实内外参放在 `ego_config.json` 指向的位置。多相机环境用 `./start_capture_linux.sh --list-json` 枚举设备，再设置 `camera_unique_id`；示例中的 `null` 只适用于能够唯一识别目标相机的情况。在开发板的 `board/` 目录运行 `./install_board_service.sh`，安装开机服务和 Bonjour 广播。安装服务不会自动开始录像。
+6. VP 与开发板连接同一个可互访的局域网，打开 VP 采集空间，确认板子连接后即可在 VP 上控制日常采集或重新标定。网络需允许 mDNS，以及开发板 HTTP 8767 和 VP UDP 8766；隔离访客网络可能无法互相发现或连接。
+
+### 文件、时间与验证边界
+
+- VP 原生 Ego 录制保存 `Documents/Recordings/<sessionID>/metadata.json` 和 `tracking_events.jsonl`。JSONL 每行属于 `head`、`leftHand` 或 `rightHand`，并非三者同步的整帧；矩阵为列优先、米单位，关节矩阵为关节到手锚点的变换。
+- `recordingTimestamp` 是收到手部事件／头部查询返回时，相对录制起点的单调时间；`systemTime` 是对应 Unix 时间。ARKit 时间另作诊断保存，均不能直接当作相机曝光时间。头部 120 Hz 是查询目标，实际频率需测量。
+- 板端保留视频、逐帧时间、前后对钟记录、每轮内外参副本及传来的 VP 原件。`process_recording.py` 提供离线时间关联与投影处理，服务本身不自动执行离线处理。
+- 时钟关联与外参分别解决时间和空间问题，实际视频／位姿同步精度仍需验证。代码明确保存 `poseAlignmentStatus = unverified`；标定的留出姿态残差不等于手部标注精度。
+- 当前板端流程在准备采集时要求已有真实内外参文件；首次安装不能跳过上述静态标定步骤。初始配置、环境安装仍需操作电脑或开发板。
+- 原生位姿先存内存、停止后写盘，长时录制内存规模及应用意外终止时的数据保留尚未验证。当前网络协议面向可信局域网，板子 ID 校验不是认证。
+- `record_poses.py` 是电脑端 gRPC 辅助接收工具，不替代原生 Ego 录制；该协议未提供源时间戳及逐关节跟踪状态。
+- 仓库保留上游 MIT 许可证及署名。`board/` 只收录配套采集／标定源码和已有离线测试，不包含厂商工具包、个人录像、设备标定结果或编译产物。下方原有内容为上游功能文档。
+
 > **For a more detailed explanation, check out this short [paper](./assets/short_paper_new.pdf).**
 
 > The recently updated App Store version of Tracking Streamer requires python library `avp_stream` over 2.50.0. It will show a warning message on the VisionOS side if the python library is outdated. You can upgrade the library by running `pip install --upgrade avp_stream`. 
@@ -27,6 +79,7 @@ A complete ecosystem for using Apple Vision Pro in robotics research — from **
 <!-- omit in toc -->
 ## Table of Contents
 
+- [Ego 数据采集扩展：开发板与 Vision Pro](#ego-数据采集扩展开发板与-vision-pro)
 - [Overview](#overview)
 - [Installations](#installations)
 - [External Network (Remote) Mode 🆕](#external-network-remote-mode-)

@@ -7,3 +7,18 @@ build/
 avp_stream/datasets/eckey.pem
 *.pem
 downloads/
+
+# Local development state and generated data
+.DS_Store
+._*
+__pycache__/
+.venv/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+recordings/
+board/work/
+board/data/
+board/calibration/
+board/ego_config.json
+board/.ego_current
