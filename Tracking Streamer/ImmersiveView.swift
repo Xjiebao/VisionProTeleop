@@ -484,6 +484,7 @@ struct ImmersiveView: View {
             }
         }
         .onDisappear {
+            appModel.stop()
             dlog("DEBUG: ImmersiveView disappeared, stopping video stream")
             videoStreamManager.stop(preserveForReconnect: false)  // Full cleanup on disappear
             fixedWorldTransform = nil

@@ -536,11 +536,14 @@ class DataManager: ObservableObject {
 class 🥽AppModel: ObservableObject {
     @AppStorage("unit") var unit: 📏Unit = .meters
     @Published private(set) var authorizationStatus: ARKitSession.AuthorizationStatus?
+    @Published private(set) var poseCalibrationSession = PoseCalibrationSession()
+    private var trackingTask: Task<Void, Never>?
+    private var handRecordingTask: Task<Void, Never>?
     
-    private let session = ARKitSession()
-    private let handTracking = HandTrackingProvider()
-    private let worldTracking = WorldTrackingProvider()
-    private let sceneReconstruction = SceneReconstructionProvider()
+    private var session = ARKitSession()
+    private var handTracking = HandTrackingProvider()
+    private var worldTracking = WorldTrackingProvider()
+    private var sceneReconstruction = SceneReconstructionProvider()
     
     // Pre-computed joint types array (static to avoid recreation on each update)
     // Ordering: [0-24] standard 25 joints (wrist + 4 fingers), [25-26] forearm joints
@@ -564,19 +567,44 @@ extension 🥽AppModel {
 #if targetEnvironment(simulator)
         dlog("Not support handTracking in simulator.")
 #else
-        
-        Task {
-            @MainActor in
+        guard trackingTask == nil else { return }
+        // A new tracking run may have a different ARKit world origin. Never append to the previous batch.
+        poseCalibrationSession = PoseCalibrationSession()
+        let trackingSession = session
+        trackingTask = Task { @MainActor in
             do {
-                try await self.session.run([self.handTracking, self.worldTracking, self.sceneReconstruction])
+                try Task.checkCancellation()
+                try await trackingSession.run([self.handTracking, self.worldTracking, self.sceneReconstruction])
+                try Task.checkCancellation()
+                let trackingSessionId = self.poseCalibrationSession.sessionId
+                self.handRecordingTask = Task { @MainActor in
+                    await self.processHandUpdates(trackingSessionId: trackingSessionId)
+                }
                 // Use predictive hand tracking with handAnchors(at:) for lower latency
                 // This polls at 120Hz and queries predicted poses at a future timestamp
                 await self.processHandTrackingPredictive()
             } catch {
+                guard !Task.isCancelled else { return }
+                self.stop()
                 dlog("\(error)")
             }
         }
 #endif
+    }
+
+    func stop() {
+        trackingTask?.cancel()
+        trackingTask = nil
+        handRecordingTask?.cancel()
+        handRecordingTask = nil
+        session.stop()
+
+        // ARKit cannot run a stopped provider again. Prepare the next run here,
+        // before the view's independent tracking tasks can subscribe to it.
+        session = ARKitSession()
+        handTracking = HandTrackingProvider()
+        worldTracking = WorldTrackingProvider()
+        sceneReconstruction = SceneReconstructionProvider()
     }
 
     func startserver() {
@@ -605,6 +633,7 @@ extension 🥽AppModel {
                 return
             }
             
+            guard !Task.isCancelled else { return }
             await function()
         }
     }
@@ -615,7 +644,9 @@ extension 🥽AppModel {
     }
     
     func processReconstructionUpdates() async {
+        guard !Task.isCancelled else { return }
         for await update in sceneReconstruction.anchorUpdates {
+            guard !Task.isCancelled else { return }
             // dlog("reconstruction update")
             let meshAnchor = update.anchor
             let mesh_description = meshAnchor.geometry.description
@@ -626,21 +657,29 @@ extension 🥽AppModel {
     
     @MainActor
     private func queryAndProcessLatestDeviceAnchor() async {
-        // Device anchors are only available when the provider is running.\
-        guard worldTracking.state == .running else { return }
-        
-        let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime())
-        // dlog(" *** device tracking running ")
-//        dlog(deviceAnchor?.originFromAnchorTransform)
-        guard let deviceAnchor else { return }
-        DataManager.shared.latestHandTrackingData.Head = deviceAnchor.originFromAnchorTransform
-            }
+        guard !Task.isCancelled, worldTracking.state == .running else { return }
+        let queryTimestamp = CACurrentMediaTime()
+        let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: queryTimestamp)
+        let receivedTimestamp = CACurrentMediaTime()
+        let receivedTime = Date()
+        RecordingManager.shared.recordDeviceAnchor(
+            deviceAnchor,
+            queryStartedTimestamp: queryTimestamp,
+            queryTimestamp: queryTimestamp,
+            receivedTimestamp: receivedTimestamp,
+            receivedTime: receivedTime,
+            trackingSessionId: poseCalibrationSession.sessionId
+        )
+        if let deviceAnchor {
+            DataManager.shared.latestHandTrackingData.Head = deviceAnchor.originFromAnchorTransform
+        }
+    }
 
     /// Process hand updates using predictive handAnchors(at:) polling instead of anchorUpdates stream.
     /// This allows querying predicted hand poses at future timestamps for lower perceived latency.
     /// The prediction offset is configurable via DataManager.shared.handPredictionOffset (0 to 0.5 seconds).
     private func processHandUpdatesPredictive() async {
-        guard handTracking.state == .running else { return }
+        guard !Task.isCancelled, handTracking.state == .running else { return }
         
         // Use pre-computed static joint types array for better performance
         let jointTypes = Self.jointTypes
@@ -686,41 +725,15 @@ extension 🥽AppModel {
         await run_device_tracking(function: self.processHandUpdatesPredictive, withFrequency: 120)
     }
     
-    /// Legacy: Process hand updates using anchorUpdates stream (event-driven, non-predictive)
-    private func processHandUpdates() async {
-        for await update in self.handTracking.anchorUpdates {
-            let handAnchor = update.anchor
-            
-            // Use pre-computed static joint types array for better performance
-            let jointTypes = Self.jointTypes
-            
-            switch handAnchor.chirality {
-            case .left:
-                if handAnchor.isTracked {
-                    DataManager.shared.latestHandTrackingData.leftWrist = handAnchor.originFromAnchorTransform
-                }
-                
-                if let skeleton = handAnchor.handSkeleton {
-                    for (index, jointType) in jointTypes.enumerated() {
-                        let joint = skeleton.joint(jointType)
-                        DataManager.shared.latestHandTrackingData.leftSkeleton.joints[index] = joint.anchorFromJointTransform
-                    }
-                }
-
-            case .right:
-                if handAnchor.isTracked {
-                    DataManager.shared.latestHandTrackingData.rightWrist = handAnchor.originFromAnchorTransform
-                }
-                
-                if let skeleton = handAnchor.handSkeleton {
-                    for (index, jointType) in jointTypes.enumerated() {
-                        let joint = skeleton.joint(jointType)
-                        DataManager.shared.latestHandTrackingData.rightSkeleton.joints[index] = joint.anchorFromJointTransform
-                    }
-                }
-            }
+    /// Record source updates independently of the predicted display/teleoperation cache.
+    private func processHandUpdates(trackingSessionId: String) async {
+        guard !Task.isCancelled else { return }
+        for await update in handTracking.anchorUpdates {
+            guard !Task.isCancelled else { return }
+            RecordingManager.shared.recordHandAnchorUpdate(update, trackingSessionId: trackingSessionId)
         }
     }
+
 }
 
 

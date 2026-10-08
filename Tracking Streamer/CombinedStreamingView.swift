@@ -2638,6 +2638,7 @@ private struct LifecycleModifiers: ViewModifier {
             .task { await appModel.processDeviceAnchorUpdates() }
             .task(priority: .low) { await appModel.processReconstructionUpdates() }
             .onAppear { handleOnAppear() }
+            .onDisappear { appModel.stop() }
     }
     
     private func handleOnAppear() {

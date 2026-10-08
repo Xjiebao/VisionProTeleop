@@ -4,7 +4,9 @@ import Combine
 import simd
 import UniformTypeIdentifiers
 import AVFoundation
+import ARKit
 import VideoToolbox
+import QuartzCore
 
 // MARK: - Recording Data Structures
 
@@ -24,6 +26,40 @@ struct RecordedFrame: Codable {
     let videoFrameIndex: Int  // Index into video frames
     let videoWidth: Int
     let videoHeight: Int
+}
+
+/// One source pose timed at receipt. recordingTimestamp is primary; ARKit time fields are diagnostic.
+struct EgoPoseSample: Codable {
+    let sequenceNumber: Int  // Source record order within this recording
+    let receivedTimestamp: Double  // Consumer/query-return time, CACurrentMediaTime seconds
+    let systemTime: Double  // Date at receipt, Unix seconds; not the pose timestamp
+    let recordingTimestamp: Double  // Primary time: receipt relative to the monotonic recording start
+    let wallClockRecordingTimestamp: Double  // Date difference from recording start, without clamping
+    let queryStartedTimestamp: Double?  // Only queried device anchors
+    let predictionOffset: Double?  // Query target offset; nil for hand events
+    let trackingSessionId: String
+    let source: String  // head, leftHand, rightHand
+    let timestamp: Double  // Diagnostic ARKit anchor timestamp, mach absolute seconds (not Unix time)
+    let updateTimestamp: Double?  // Hand AnchorUpdate only; unavailable for queried device anchors
+    let queryTimestamp: Double?  // Device query target; not a replacement for timestamp
+    let event: String?  // Hand AnchorUpdate event, including removed
+    let isTracked: Bool
+    let originFromAnchorTransform: [Float]  // Anchor/device -> ARKit world, meters, column-major
+    let joints: [EgoJointSample]?  // Nil when ARKit supplies no skeleton
+}
+
+struct EgoJointSample: Codable {
+    let name: String
+    let isTracked: Bool
+    let anchorFromJointTransform: [Float]  // Joint -> hand anchor, meters, column-major
+}
+
+/// A value snapshot of a hand anchor and its joints.
+struct EgoPoseSnapshot {
+    let timestamp: Double
+    let isTracked: Bool
+    let originFromAnchorTransform: [Float]
+    let joints: [EgoJointSample]?
 }
 
 /// A single frame of simulation data
@@ -114,11 +150,12 @@ struct RecordingMetadata: Codable {
     // Calibration data
     let intrinsicCalibration: [String: Any]?
     let extrinsicCalibration: [String: Any]?
+    let poseData: [String: String]?  // Source pose timing contract; alignment is not yet validated
     
     enum CodingKeys: String, CodingKey {
         case version, createdAt, duration, frameCount, hasVideo
         case hasLeftHand, hasRightHand, hasSimulationData, hasUSDZ, videoSource, averageFPS, deviceInfo
-        case intrinsicCalibration, extrinsicCalibration, recordingType
+        case intrinsicCalibration, extrinsicCalibration, recordingType, poseData
     }
     
     func encode(to encoder: Encoder) throws {
@@ -136,6 +173,7 @@ struct RecordingMetadata: Codable {
         try container.encode(videoSource, forKey: .videoSource)
         try container.encode(averageFPS, forKey: .averageFPS)
         try container.encode(deviceInfo, forKey: .deviceInfo)
+        try container.encodeIfPresent(poseData, forKey: .poseData)
         // Encode intrinsic calibration as JSON data
         if let intrinsic = intrinsicCalibration {
             let jsonData = try JSONSerialization.data(withJSONObject: intrinsic, options: [])
@@ -165,6 +203,7 @@ struct RecordingMetadata: Codable {
         videoSource = try container.decode(String.self, forKey: .videoSource)
         averageFPS = try container.decode(Double.self, forKey: .averageFPS)
         deviceInfo = try container.decode(DeviceInfo.self, forKey: .deviceInfo)
+        poseData = try container.decodeIfPresent([String: String].self, forKey: .poseData)
         // Decode intrinsic calibration from JSON string
         if let jsonString = try container.decodeIfPresent(String.self, forKey: .intrinsicCalibration),
            let jsonData = jsonString.data(using: .utf8),
@@ -185,7 +224,7 @@ struct RecordingMetadata: Codable {
     
     init(createdAt: Date, duration: Double, frameCount: Int, hasVideo: Bool, hasLeftHand: Bool,
          hasRightHand: Bool, hasSimulationData: Bool, hasUSDZ: Bool, videoSource: String, averageFPS: Double,
-         deviceInfo: DeviceInfo, recordingType: RecordingType, intrinsicCalibration: [String: Any]? = nil, extrinsicCalibration: [String: Any]? = nil) {
+         deviceInfo: DeviceInfo, recordingType: RecordingType, intrinsicCalibration: [String: Any]? = nil, extrinsicCalibration: [String: Any]? = nil, poseData: [String: String]? = nil) {
         self.createdAt = createdAt
         self.duration = duration
         self.frameCount = frameCount
@@ -200,6 +239,7 @@ struct RecordingMetadata: Codable {
         self.recordingType = recordingType
         self.intrinsicCalibration = intrinsicCalibration
         self.extrinsicCalibration = extrinsicCalibration
+        self.poseData = poseData
     }
 }
 
@@ -258,7 +298,6 @@ class RecordingManager: ObservableObject {
     @Published var lastRecordingURL: URL? = nil
     @Published var recordingError: String? = nil
     @Published var isSaving: Bool = false
-    
     // Cloud storage (synced from iOS companion app)
     @Published var cloudProvider: CloudStorageProvider = .iCloudDrive
     @Published var isUploadingToCloud: Bool = false
@@ -282,6 +321,11 @@ class RecordingManager: ObservableObject {
     
     // MARK: - Private Properties
     private var recordingStartTime: Date?
+    private var recordingStartMonotonicTimestamp: TimeInterval = 0
+    private var isEgoRecording = false  // Freeze the mode at recording start
+    private var egoPoseSamples: [EgoPoseSample] = []  // MainActor-owned immutable source samples
+    private var egoSequenceNumber = 0
+    var isRecordingEgoPoses: Bool { isRecording && isEgoRecording }
     private var durationTimer: Timer?
     private var sessionID: String = ""
     private let recordingQueue = DispatchQueue(label: "com.visionproteleop.recording", qos: .userInitiated)
@@ -316,21 +360,23 @@ class RecordingManager: ObservableObject {
     
     private init() {
         // Load saved storage location
-        if let savedLocation = UserDefaults.standard.string(forKey: "recordingStorageLocation"),
+        if CloudStorageSettings.isEnabled,
+           let savedLocation = UserDefaults.standard.string(forKey: "recordingStorageLocation"),
            let location = RecordingStorageLocation(rawValue: savedLocation) {
             self.storageLocation = location
         } else {
             self.storageLocation = .local  // Default to local storage
         }
-        
         // Load auto-recording preference (default to true for auto-record by default)
         self.autoRecordingEnabled = UserDefaults.standard.object(forKey: "autoRecordingEnabled") as? Bool ?? true
+        // The background video writer reads this preference directly.
+        UserDefaults.standard.set(storageLocation.rawValue, forKey: "recordingStorageLocation")
         
         // Load cloud provider from keychain (synced from iOS)
-        loadCloudSettings()
-        
-        // Observe cloud settings changes
-        setupCloudSettingsObserver()
+        if CloudStorageSettings.isEnabled {
+            loadCloudSettings()
+            setupCloudSettingsObserver()
+        }
     }
     
     /// Setup observer for cloud settings changes (from iCloud Keychain sync)
@@ -347,6 +393,7 @@ class RecordingManager: ObservableObject {
     
     /// Load cloud storage settings from iCloud Keychain (set by iOS companion app)
     func loadCloudSettings() {
+        guard CloudStorageSettings.isEnabled else { return }
         CloudStorageSettings.shared.loadSettings()
         cloudProvider = CloudStorageSettings.shared.getActiveProvider()
         // dlog("☁️ [RecordingManager] Cloud provider: \(cloudProvider.displayName)")
@@ -357,6 +404,7 @@ class RecordingManager: ObservableObject {
     /// Called when first video frame is received. Starts recording if auto-recording is enabled.
     /// Video source can be UVC camera or network stream.
     func onFirstVideoFrame() {
+        guard UserDefaults.standard.string(forKey: "appMode") != "egorecord" else { return }
         guard autoRecordingEnabled && !isRecording && !userManuallyStopped else { return }
         
         dlog("🔴 [RecordingManager] Auto-starting recording on first video frame")
@@ -390,7 +438,14 @@ class RecordingManager: ObservableObject {
     // MARK: - Recording Control
     
     func startRecording() {
-        guard !isRecording else { return }
+        startLocalRecording()
+    }
+
+    private func startLocalRecording() {
+        guard !isRecording, !isSaving else { return }
+        isEgoRecording = UserDefaults.standard.string(forKey: "appMode") == "egorecord"
+        egoPoseSamples.removeAll()
+        egoSequenceNumber = 0
         
         dlog("🔴 [RecordingManager] Starting recording (video-driven mode)...")
         
@@ -404,12 +459,15 @@ class RecordingManager: ObservableObject {
             self?.isWriterSessionStarted = false
             self?.videoSize = .zero
             self?.lastPresentationTime = nil
+            self?.recordingFolderURL = nil
         }
         
+        recordingStartMonotonicTimestamp = CACurrentMediaTime()
         recordingStartTime = Date()
         frameCount = 0
         recordingDuration = 0
         recordingError = nil
+        lastRecordingURL = nil
         
         // Generate session ID with UUID to ensure uniqueness even within same second
         let formatter = DateFormatter()
@@ -425,7 +483,7 @@ class RecordingManager: ObservableObject {
             Task { @MainActor in
                 guard let self = self, let startTime = self.recordingStartTime else { return }
                 self.recordingDuration = Date().timeIntervalSince(startTime)
-                self.frameCount = max(self.pendingFrameCount, self.simulationFrameCount)
+                self.frameCount = self.isEgoRecording ? self.egoPoseSamples.count : max(self.pendingFrameCount, self.simulationFrameCount)
                 
                 // After 0.5 seconds, if no video/sim data has arrived, start hand-tracking-only mode
                 if self.recordingDuration > 0.5 {
@@ -560,6 +618,10 @@ class RecordingManager: ObservableObject {
     }
     
     func stopRecording() {
+        stopLocalRecording()
+    }
+
+    private func stopLocalRecording() {
         guard isRecording else { return }
         
         dlog("🔴 [RecordingManager] Stopping recording...")
@@ -573,7 +635,7 @@ class RecordingManager: ObservableObject {
         handTrackingRecordingTimer = nil
         
         // Sync final count
-        frameCount = pendingFrameCount
+        frameCount = isEgoRecording ? egoPoseSamples.count : pendingFrameCount
         
         // Calculate final duration
         if let startTime = recordingStartTime {
@@ -584,17 +646,95 @@ class RecordingManager: ObservableObject {
         dlog("   Duration: \(String(format: "%.1f", recordingDuration))s")
         dlog("   Frames: \(frameCount) (~\(String(format: "%.0f", Double(frameCount) / max(recordingDuration, 0.1))) fps)")
         
+        // Block a new recording before the asynchronous save can yield and release its buffers.
+        isSaving = true
         // Save the recording
         Task {
             await saveRecording()
         }
     }
     
+    // MARK: - EgoRecord Source Poses
+
+    func recordDeviceAnchor(_ anchor: DeviceAnchor?, queryStartedTimestamp: TimeInterval,
+                            queryTimestamp: TimeInterval, receivedTimestamp: TimeInterval,
+                            receivedTime: Date, trackingSessionId: String) {
+        guard isRecordingEgoPoses, let startTime = recordingStartTime, let anchor else { return }
+        egoSequenceNumber += 1
+        let relativeTime = receivedTimestamp - recordingStartMonotonicTimestamp
+        let wallClockRelativeTime = receivedTime.timeIntervalSince(startTime)
+        egoPoseSamples.append(EgoPoseSample(
+            sequenceNumber: egoSequenceNumber,
+            receivedTimestamp: receivedTimestamp,
+            systemTime: receivedTime.timeIntervalSince1970,
+            recordingTimestamp: relativeTime,
+            wallClockRecordingTimestamp: wallClockRelativeTime,
+            queryStartedTimestamp: queryStartedTimestamp,
+            predictionOffset: 0,
+            trackingSessionId: trackingSessionId,
+            source: "head",
+            timestamp: anchor.timestamp,
+            updateTimestamp: nil,
+            queryTimestamp: queryTimestamp,
+            event: nil,
+            isTracked: anchor.isTracked,
+            originFromAnchorTransform: matrixToArray(anchor.originFromAnchorTransform),
+            joints: nil
+        ))
+    }
+
+    func recordHandAnchorUpdate(_ update: AnchorUpdate<HandAnchor>, trackingSessionId: String) {
+        guard isRecordingEgoPoses, let startTime = recordingStartTime else { return }
+        // Capture consumer time before reading/copying the anchor and its skeleton.
+        let receivedTimestamp = CACurrentMediaTime()
+        let receivedTime = Date()
+        let updateTimestamp = update.timestamp
+        let anchor = update.anchor
+        let pose = handPoseSnapshot(anchor)
+        egoSequenceNumber += 1
+        let event: String
+        switch update.event {
+        case .added: event = "added"
+        case .updated: event = "updated"
+        case .removed: event = "removed"
+        }
+        egoPoseSamples.append(EgoPoseSample(
+            sequenceNumber: egoSequenceNumber,
+            receivedTimestamp: receivedTimestamp,
+            systemTime: receivedTime.timeIntervalSince1970,
+            recordingTimestamp: receivedTimestamp - recordingStartMonotonicTimestamp,
+            wallClockRecordingTimestamp: receivedTime.timeIntervalSince(startTime),
+            queryStartedTimestamp: nil,
+            predictionOffset: nil,
+            trackingSessionId: trackingSessionId,
+            source: anchor.chirality == .left ? "leftHand" : "rightHand",
+            timestamp: pose.timestamp,
+            updateTimestamp: updateTimestamp,
+            queryTimestamp: nil,
+            event: event,
+            isTracked: pose.isTracked,
+            originFromAnchorTransform: pose.originFromAnchorTransform,
+            joints: pose.joints
+        ))
+    }
+
+    private func handPoseSnapshot(_ anchor: HandAnchor) -> EgoPoseSnapshot {
+        EgoPoseSnapshot(
+            timestamp: anchor.timestamp,
+            isTracked: anchor.isTracked,
+            originFromAnchorTransform: matrixToArray(anchor.originFromAnchorTransform),
+            joints: anchor.handSkeleton?.allJoints.map { joint in
+                EgoJointSample(name: joint.name.description, isTracked: joint.isTracked,
+                               anchorFromJointTransform: matrixToArray(joint.anchorFromJointTransform))
+            }
+        )
+    }
+
     // MARK: - Frame Recording (Video-Driven)
     
     /// Record a video frame with the current tracking data.
     /// This is VIDEO-DRIVEN: call this whenever a new video frame arrives.
-    /// The latest tracking data is captured and paired with this video frame.
+    /// Non-Ego modes pair the latest tracking data with this video frame.
     nonisolated func recordVideoFrame(_ videoFrame: UIImage) {
         // Capture time immediately
         let captureTime = Date()
@@ -612,8 +752,8 @@ class RecordingManager: ObservableObject {
         let timestamp = max(0, captureTime.timeIntervalSince(startTime))
         let systemTime = captureTime.timeIntervalSince1970
         
-        // Capture the LATEST tracking data at this moment
-        let trackingData = DataManager.shared.latestHandTrackingData
+        // EgoRecord saves source events independently of video frames.
+        let trackingData = isEgoRecording ? nil : DataManager.shared.latestHandTrackingData
         
         // Get image dimensions
         let width = Int(videoFrame.size.width)
@@ -681,25 +821,27 @@ class RecordingManager: ObservableObject {
                 }
             }
             
-            // Convert tracking data
-            let headMatrixArray: [Float] = self.matrixToArray(trackingData.Head)
-            let leftHand = self.extractHandJointData(wrist: trackingData.leftWrist, skeleton: trackingData.leftSkeleton)
-            let rightHand = self.extractHandJointData(wrist: trackingData.rightWrist, skeleton: trackingData.rightSkeleton)
+            if let trackingData {
+                // Convert tracking data
+                let headMatrixArray: [Float] = self.matrixToArray(trackingData.Head)
+                let leftHand = self.extractHandJointData(wrist: trackingData.leftWrist, skeleton: trackingData.leftSkeleton)
+                let rightHand = self.extractHandJointData(wrist: trackingData.rightWrist, skeleton: trackingData.rightSkeleton)
             
-            // Create recorded frame (without video data - that's in the MP4)
-            let recordedFrame = RecordedFrame(
-                timestamp: timestamp,
-                systemTime: systemTime,
-                headMatrix: headMatrixArray,
-                leftHand: leftHand,
-                rightHand: rightHand,
-                videoFrameIndex: frameIndex,
-                videoWidth: width,
-                videoHeight: height
-            )
+                // Create recorded frame (without video data - that's in the MP4)
+                let recordedFrame = RecordedFrame(
+                    timestamp: timestamp,
+                    systemTime: systemTime,
+                    headMatrix: headMatrixArray,
+                    leftHand: leftHand,
+                    rightHand: rightHand,
+                    videoFrameIndex: frameIndex,
+                    videoWidth: width,
+                    videoHeight: height
+                )
             
-            // Append to tracking data array
-            self.recordedFrames.append(recordedFrame)
+                // Append to tracking data array
+                self.recordedFrames.append(recordedFrame)
+            }
             self.pendingFrameCount += 1
         }
     }
@@ -710,6 +852,7 @@ class RecordingManager: ObservableObject {
     /// This starts a timer that samples hand tracking at the configured Hz.
     /// Call this when you want to record hand tracking without video or simulation.
     func startHandTrackingOnlyRecording() {
+        guard !isEgoRecording else { return }
         guard isRecording else {
             dlog("⚠️ [RecordingManager] Cannot start hand tracking recording - recording not active")
             return
@@ -730,7 +873,7 @@ class RecordingManager: ObservableObject {
     
     /// Record a single hand tracking frame (used by timer-based recording)
     private func recordHandTrackingFrame() {
-        guard isRecording, let startTime = recordingStartTime else { return }
+        guard isRecording, !isEgoRecording, let startTime = recordingStartTime else { return }
         
         let captureTime = Date()
         let timestamp = max(0, captureTime.timeIntervalSince(startTime))
@@ -783,7 +926,7 @@ class RecordingManager: ObservableObject {
     /// Check if we should use hand-tracking-only mode (no video/sim data source)
     /// Called periodically to detect when to start hand-tracking-only recording
     func checkAndStartHandTrackingOnlyMode() {
-        guard isRecording else { return }
+        guard isRecording, !isEgoRecording else { return }
         guard handTrackingRecordingTimer == nil else { return }  // Already running
         guard !isWriterSessionStarted else { return }  // Video is active
         guard simulationFrameCount == 0 else { return }  // Simulation is active
@@ -811,6 +954,7 @@ class RecordingManager: ObservableObject {
     
     /// Called when first simulation frame is received. Starts recording if auto-recording is enabled.
     func onFirstSimulationFrame() {
+        guard UserDefaults.standard.string(forKey: "appMode") != "egorecord" else { return }
         guard autoRecordingEnabled && !isRecording && !userManuallyStopped else { return }
         
         dlog("🔴 [RecordingManager] Auto-starting recording on first simulation frame")
@@ -829,7 +973,7 @@ class RecordingManager: ObservableObject {
         var leftHand: HandJointData? = nil
         var rightHand: HandJointData? = nil
         
-        if let trackingData = trackingData {
+        if !isEgoRecording, let trackingData = trackingData {
             headMatrixArray = matrixToArray(trackingData.Head)
             leftHand = extractHandJointData(wrist: trackingData.leftWrist, skeleton: trackingData.leftSkeleton)
             rightHand = extractHandJointData(wrist: trackingData.rightWrist, skeleton: trackingData.rightSkeleton)
@@ -957,7 +1101,10 @@ class RecordingManager: ObservableObject {
             return
         }
         isSaveInProgress = true
-        defer { isSaveInProgress = false }
+        defer {
+            isSaveInProgress = false
+            isSaving = false
+        }
         
         // Wait for recording queue to finish processing
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -966,13 +1113,16 @@ class RecordingManager: ObservableObject {
             }
         }
         
-        guard !recordedFrames.isEmpty || !simulationFrames.isEmpty else {
+        guard assetWriter != nil || !recordedFrames.isEmpty || !simulationFrames.isEmpty || !egoPoseSamples.isEmpty else {
             recordingError = "No frames recorded"
             return
         }
         
+        guard let recordingStartTime else {
+            recordingError = "录制起始时间缺失，无法保存时间诊断。"
+            return
+        }
         isSaving = true
-        defer { isSaving = false }
         
         dlog("💾 [RecordingManager] Saving recording to \(storageLocation.rawValue)...")
         dlog("   Frames to save: \(recordedFrames.count) (Video), \(simulationFrames.count) (Sim)")
@@ -1026,6 +1176,10 @@ class RecordingManager: ObservableObject {
             isWriterSessionStarted = false
             recordingFolderURL = nil
             
+            if isEgoRecording && egoPoseSamples.isEmpty {
+                throw RecordingError.noSourcePoses
+            }
+
             // Get extrinsic calibration if available
             let extrinsicCalibrationDict: [String: Any]?
             if let currentCalibration = ExtrinsicCalibrationManager.shared.currentCalibration {
@@ -1042,8 +1196,8 @@ class RecordingManager: ObservableObject {
                 intrinsicCalibrationDict = nil
             }
             
-            // Determine actual frame count (use max of video and simulation frames)
-            let actualFrameCount = max(recordedFrames.count, simulationFrames.count)
+            // EgoRecord counts individual head/hand source records.
+            let actualFrameCount = isEgoRecording ? egoPoseSamples.count : max(recordedFrames.count, simulationFrames.count)
             
             // Check if video file was actually written
             let videoURL = recordingFolder.appendingPathComponent("video.mp4")
@@ -1052,9 +1206,7 @@ class RecordingManager: ObservableObject {
             
             // Determine recording type based on app mode and data present
             let recordingType: RecordingType
-            let appMode = UserDefaults.standard.string(forKey: "appMode") ?? "teleop"
-            
-            if appMode == "egorecord" {
+            if isEgoRecording {
                 recordingType = .egorecord
             } else if let url = usdzURL {
                 // Check if USDZ filename contains "isaac" to distinguish simulation types
@@ -1069,12 +1221,12 @@ class RecordingManager: ObservableObject {
             
             // Save metadata
             let metadata = RecordingMetadata(
-                createdAt: recordingStartTime ?? Date(),
+                createdAt: recordingStartTime,
                 duration: recordingDuration,
                 frameCount: actualFrameCount,
                 hasVideo: hasActualVideo,
-                hasLeftHand: recordedFrames.contains { $0.leftHand != nil },
-                hasRightHand: recordedFrames.contains { $0.rightHand != nil },
+                hasLeftHand: isEgoRecording ? egoPoseSamples.contains { $0.source == "leftHand" && $0.isTracked } : recordedFrames.contains { $0.leftHand != nil },
+                hasRightHand: isEgoRecording ? egoPoseSamples.contains { $0.source == "rightHand" && $0.isTracked } : recordedFrames.contains { $0.rightHand != nil },
                 hasSimulationData: !simulationFrames.isEmpty,
                 hasUSDZ: usdzURL != nil,
                 videoSource: DataManager.shared.videoSource.rawValue,
@@ -1086,7 +1238,32 @@ class RecordingManager: ObservableObject {
                 ),
                 recordingType: recordingType,
                 intrinsicCalibration: intrinsicCalibrationDict,
-                extrinsicCalibration: extrinsicCalibrationDict
+                extrinsicCalibration: extrinsicCalibrationDict,
+                poseData: isEgoRecording ? [
+                    "file": "tracking_events.jsonl",
+                    "formatVersion": "3.0",
+                    "frameCountUnit": "source_records",
+                    "averageFPSUnit": "source_records_per_second",
+                    "primaryTimestampField": "recordingTimestamp",
+                    "unixTimestampField": "systemTime",
+                    "arkitTimestampRole": "diagnostic_only",
+                    "sequenceNumberScope": "source_records_within_recording",
+                    "receivedTimestampSource": "CACurrentMediaTime_at_consumer_or_query_return",
+                    "systemTimeSource": "Date.timeIntervalSince1970_at_receipt",
+                    "recordingTimestampSource": "receivedTimestamp-recordingStartMonotonicTimestamp",
+                    "wallClockRecordingTimestampSource": "receipt_Date-recording_start_Date; unclamped",
+                    "recordingStartMonotonicTimestamp": String(recordingStartMonotonicTimestamp),
+                    "recordingStartSystemTime": String(recordingStartTime.timeIntervalSince1970),
+                    "sourcePoseCount": String(egoPoseSamples.count),
+                    "poseAlignmentStatus": "unverified",
+                    "timestampSource": "anchor.timestamp",
+                    "clock": "mach_absolute_time",
+                    "timeUnit": "seconds",
+                    "matrixLayout": "column_major",
+                    "translationUnit": "meters",
+                    "handPoseSource": "anchorUpdates",
+                    "headPoseSource": "queryDeviceAnchor_current_time"
+                ] : nil
             )
             
             let metadataURL = recordingFolder.appendingPathComponent("metadata.json")
@@ -1095,22 +1272,29 @@ class RecordingManager: ObservableObject {
             let metadataData = try encoder.encode(metadata)
             try metadataData.write(to: metadataURL)
             
-            // Save tracking data (JSON Lines format)
-            let trackingURL = recordingFolder.appendingPathComponent("tracking.jsonl")
-            var trackingContent = ""
+            // Save source events for EgoRecord, or frame snapshots for other modes.
+            let trackingURL = recordingFolder.appendingPathComponent(isEgoRecording ? "tracking_events.jsonl" : "tracking.jsonl")
             let lineEncoder = JSONEncoder()
             lineEncoder.outputFormatting = .sortedKeys
-            
-            for frame in recordedFrames {
-                if let data = try? lineEncoder.encode(frame),
-                   let string = String(data: data, encoding: .utf8) {
-                    trackingContent += string + "\n"
+            if isEgoRecording {
+                var trackingData = Data()
+                for sample in egoPoseSamples {
+                    trackingData.append(try lineEncoder.encode(sample))
+                    trackingData.append(0x0A)
                 }
+                try trackingData.write(to: trackingURL, options: .atomic)
+            } else {
+                var trackingContent = ""
+                for frame in recordedFrames {
+                    if let data = try? lineEncoder.encode(frame),
+                       let string = String(data: data, encoding: .utf8) {
+                        trackingContent += string + "\n"
+                    }
+                }
+                try trackingContent.write(to: trackingURL, atomically: true, encoding: .utf8)
             }
-            
-            try trackingContent.write(to: trackingURL, atomically: true, encoding: .utf8)
             dlog("💾 [RecordingManager] Tracking data saved")
-            
+
             // Save simulation data if available
             if !simulationFrames.isEmpty {
                 let simURL = recordingFolder.appendingPathComponent("mjdata.jsonl")
@@ -1157,7 +1341,8 @@ class RecordingManager: ObservableObject {
                 deviceInfo: metadata.deviceInfo,
                 recordingType: metadata.recordingType,
                 intrinsicCalibration: metadata.intrinsicCalibration,
-                extrinsicCalibration: metadata.extrinsicCalibration
+                extrinsicCalibration: metadata.extrinsicCalibration,
+                poseData: metadata.poseData
             )
             
             // Re-save metadata with updated flags
@@ -1168,13 +1353,14 @@ class RecordingManager: ObservableObject {
             
             dlog("✅ [RecordingManager] Recording saved successfully to: \(recordingFolder.path)")
             
-            dlog("☁️ [RecordingManager] Calling uploadToCloudIfNeeded...")
-            // Upload to cloud storage if configured
-            await uploadToCloudIfNeeded(recordingFolder: recordingFolder)
+            if CloudStorageSettings.isEnabled && storageLocation == .cloud {
+                await uploadToCloudIfNeeded(recordingFolder: recordingFolder)
+            }
             
             // Clear memory
             recordedFrames.removeAll()
             videoFrames.removeAll()
+            egoPoseSamples.removeAll()
             
         } catch {
             recordingError = "Failed to save: \(error.localizedDescription)"
@@ -1428,6 +1614,7 @@ enum RecordingError: Error, LocalizedError {
     case encodingFailed
     case writeFailed
     case videoWriterSetupFailed
+    case noSourcePoses
     
     var errorDescription: String? {
         switch self {
@@ -1439,6 +1626,8 @@ enum RecordingError: Error, LocalizedError {
             return "Failed to write recording to disk"
         case .videoWriterSetupFailed:
             return "Failed to set up video writer"
+        case .noSourcePoses:
+            return "未采集到 ARKit 源位姿，请确认追踪正在运行后重新录制。"
         }
     }
 }

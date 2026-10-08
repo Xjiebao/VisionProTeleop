@@ -110,6 +110,7 @@ struct MuJoCoStreamingView: View {
             }
         }
         .onDisappear {
+            appModel.stop()
             Task {
                 networkManager.updateConnectionStatus("Stopping Server...")
                 await grpcManager.stopServer()
