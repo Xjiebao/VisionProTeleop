@@ -538,6 +538,8 @@ class 🥽AppModel: ObservableObject {
     @Published private(set) var authorizationStatus: ARKitSession.AuthorizationStatus?
     @Published private(set) var poseCalibrationSession = PoseCalibrationSession()
     private var trackingTask: Task<Void, Never>?
+    private var poseSamplingSessionReady = false
+    private var poseExportCount = 0
     private var handRecordingTask: Task<Void, Never>?
     
     private var session = ARKitSession()
@@ -568,14 +570,17 @@ extension 🥽AppModel {
         dlog("Not support handTracking in simulator.")
 #else
         guard trackingTask == nil else { return }
+        poseSamplingSessionReady = false
         // A new tracking run may have a different ARKit world origin. Never append to the previous batch.
         poseCalibrationSession = PoseCalibrationSession()
+        poseExportCount = 0
         let trackingSession = session
         trackingTask = Task { @MainActor in
             do {
                 try Task.checkCancellation()
                 try await trackingSession.run([self.handTracking, self.worldTracking, self.sceneReconstruction])
                 try Task.checkCancellation()
+                self.poseSamplingSessionReady = true
                 let trackingSessionId = self.poseCalibrationSession.sessionId
                 self.handRecordingTask = Task { @MainActor in
                     await self.processHandUpdates(trackingSessionId: trackingSessionId)
@@ -598,6 +603,7 @@ extension 🥽AppModel {
         trackingTask = nil
         handRecordingTask?.cancel()
         handRecordingTask = nil
+        poseSamplingSessionReady = false
         session.stop()
 
         // ARKit cannot run a stopped provider again. Prepare the next run here,
@@ -606,6 +612,72 @@ extension 🥽AppModel {
         handTracking = HandTrackingProvider()
         worldTracking = WorldTrackingProvider()
         sceneReconstruction = SceneReconstructionProvider()
+    }
+
+    enum PoseSamplingError: LocalizedError {
+        case providerNotRunning, anchorUnavailable, anchorNotTracked, storageUnavailable, noSamples
+
+        var errorDescription: String? {
+            switch self {
+            case .providerNotRunning: return "ARKit 世界追踪尚未运行或已暂停。"
+            case .anchorUnavailable: return "ARKit 未返回当前设备位姿，请停稳后重试。"
+            case .anchorNotTracked: return "当前设备位姿未被有效追踪，请等待追踪恢复。"
+            case .storageUnavailable: return "本地 Documents 目录不可用。"
+            case .noSamples: return "当前批次还没有已保存的样本。"
+            }
+        }
+    }
+
+    func queryDevicePoseForSampling() throws -> simd_float4x4 {
+        guard poseSamplingSessionReady, worldTracking.state == .running else {
+            throw PoseSamplingError.providerNotRunning
+        }
+        guard let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) else {
+            throw PoseSamplingError.anchorUnavailable
+        }
+        guard deviceAnchor.isTracked else {
+            throw PoseSamplingError.anchorNotTracked
+        }
+        return deviceAnchor.originFromAnchorTransform
+    }
+
+    private var poseRecordingsURL: URL? {
+        // Match RecordingManager's local directory regardless of recording/cloud preferences.
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Recordings", isDirectory: true)
+    }
+
+    var poseCalibrationFileURL: URL? {
+        guard let recordingsURL = poseRecordingsURL else { return nil }
+        return poseCalibrationSession.fileURL(in: recordingsURL)
+    }
+
+    func savePoseSample() throws -> String {
+        let matrix = try queryDevicePoseForSampling()
+        guard let recordingsURL = poseRecordingsURL else {
+            throw PoseSamplingError.storageUnavailable
+        }
+        return try poseCalibrationSession.save(matrix: matrix, in: recordingsURL)
+    }
+
+    /// Share an immutable snapshot with a unique name for this batch and export attempt.
+    func preparePoseExport() throws -> URL {
+        guard let lastSample = poseCalibrationSession.samples.last else {
+            throw PoseSamplingError.noSamples
+        }
+        guard let sourceURL = poseCalibrationFileURL else {
+            throw PoseSamplingError.storageUnavailable
+        }
+        let exportNumber = poseExportCount + 1
+        let fileName = "pose_calibration_\(poseCalibrationSession.sessionId)_001-\(lastSample.sampleId)_export\(String(format: "%03d", exportNumber)).json"
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PoseCalibrationExports", isDirectory: true)
+        let exportURL = directory.appendingPathComponent(fileName)
+        let data = try Data(contentsOf: sourceURL)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try data.write(to: exportURL, options: .atomic)
+        poseExportCount = exportNumber
+        return exportURL
     }
 
     func startserver() {

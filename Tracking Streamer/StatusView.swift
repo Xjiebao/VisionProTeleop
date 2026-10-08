@@ -209,10 +209,12 @@ struct StatusOverlay: View {
     @Binding var previewStatusPosition: (x: Float, y: Float)?
     @Binding var previewStatusActive: Bool
     var mujocoManager: (any MuJoCoManager)?  // Optional MuJoCo manager for combined streaming
+    let appModel: 🥽AppModel?
     @ObservedObject var dataManager = DataManager.shared
     @ObservedObject private var uvcCameraManager = UVCCameraManager.shared
     @ObservedObject private var recordingManager = RecordingManager.shared
     @ObservedObject private var captureBoard = CaptureBoardClient.shared
+    @State private var calibrationBoard: CaptureBoard?
     @State private var ipAddresses: [(name: String, address: String)] = []
     @State private var pythonConnected: Bool = false
     @State private var pythonIP: String = "Not connected"
@@ -222,6 +224,7 @@ struct StatusOverlay: View {
     @State private var showLocalExitConfirmation: Bool = false
     @State private var mujocoStatusUpdateTrigger: Bool = false  // Trigger for MuJoCo status updates
     @State private var showCalibrationSheet: Bool = false
+    @State private var showPoseSamplingSheet = false
     @State private var showExtrinsicCalibrationSheet: Bool = false
     @State private var showCalibrationWizard: Bool = false
     @State private var startCalibrationVerification: Bool = false
@@ -239,7 +242,7 @@ struct StatusOverlay: View {
     // Flashing animation for warnings
     @State private var flashingOpacity: Double = 1.0
     
-    init(hasFrames: Binding<Bool> = .constant(false), showVideoStatus: Bool = true, isMinimized: Binding<Bool> = .constant(false), showViewControls: Binding<Bool> = .constant(false), previewZDistance: Binding<Float?> = .constant(nil), previewActive: Binding<Bool> = .constant(false), userInteracted: Binding<Bool> = .constant(false), videoMinimized: Binding<Bool> = .constant(false), videoFixed: Binding<Bool> = .constant(false), previewStatusPosition: Binding<(x: Float, y: Float)?> = .constant(nil), previewStatusActive: Binding<Bool> = .constant(false), mujocoManager: (any MuJoCoManager)? = nil) {
+    init(hasFrames: Binding<Bool> = .constant(false), showVideoStatus: Bool = true, isMinimized: Binding<Bool> = .constant(false), showViewControls: Binding<Bool> = .constant(false), previewZDistance: Binding<Float?> = .constant(nil), previewActive: Binding<Bool> = .constant(false), userInteracted: Binding<Bool> = .constant(false), videoMinimized: Binding<Bool> = .constant(false), videoFixed: Binding<Bool> = .constant(false), previewStatusPosition: Binding<(x: Float, y: Float)?> = .constant(nil), previewStatusActive: Binding<Bool> = .constant(false), mujocoManager: (any MuJoCoManager)? = nil, appModel: 🥽AppModel? = nil) {
         self._hasFrames = hasFrames
         self.showVideoStatus = showVideoStatus
         self._isMinimized = isMinimized
@@ -252,6 +255,7 @@ struct StatusOverlay: View {
         self._previewStatusPosition = previewStatusPosition
         self._previewStatusActive = previewStatusActive
         self.mujocoManager = mujocoManager
+        self.appModel = appModel
 //        dlog("🟢 [StatusView] StatusOverlay init called, hasFrames: \(hasFrames.wrappedValue), showVideoStatus: \(showVideoStatus), mujocoEnabled: \(mujocoManager != nil)")
     }
     
@@ -265,6 +269,16 @@ struct StatusOverlay: View {
                 }
             }
             .animation(.spring(response: 0.45, dampingFraction: 0.85), value: isMinimized)
+            .disabled(calibrationBoard != nil)
+
+            if let board = calibrationBoard {
+                BoardCalibrationView(boardID: board.id, onDismiss: {
+                    calibrationBoard = nil
+                })
+                .background(.regularMaterial)
+                .cornerRadius(20)
+                .shadow(radius: 20)
+            }
 
             // Calibration overlay
             if showCalibrationSheet {
@@ -300,6 +314,16 @@ struct StatusOverlay: View {
                 .shadow(radius: 20)
             }
             
+            if showPoseSamplingSheet, let appModel {
+                PoseCalibrationView(appModel: appModel, onDismiss: {
+                    showPoseSamplingSheet = false
+                })
+                .frame(width: 520, height: 680)
+                .background(.regularMaterial)
+                .cornerRadius(20)
+                .shadow(radius: 20)
+            }
+
             // Python Calibration Status Overlay (from calibration_server.py)
             if dataManager.pythonCalibrationActive {
                 PythonCalibrationStatusOverlay(
@@ -316,7 +340,7 @@ struct StatusOverlay: View {
         .task(id: captureBoard.selectedBoardID) {
             while !Task.isCancelled {
                 // Recording and calibration already refresh board status every two seconds.
-                if captureBoard.selectedBoard != nil,
+                if captureBoard.selectedBoard != nil, calibrationBoard == nil,
                    !recordingManager.hasBoardCapture, !recordingManager.isBoardOperationInProgress {
                     do {
                         _ = try await captureBoard.status()
@@ -1665,6 +1689,9 @@ struct StatusOverlay: View {
                  recordingManager.pendingBoardConfirmation != nil)))
             BoardCaptureConfirmationView()
             BoardTransferStatusView()
+            Button("外参标定") { calibrationBoard = captureBoard.selectedBoard }
+                .disabled(captureBoard.selectedBoard == nil || recordingManager.hasBoardCapture ||
+                          recordingManager.isSaving || recordingManager.isBoardOperationInProgress)
         }
     }
 
@@ -1848,6 +1875,17 @@ struct StatusOverlay: View {
                 cameraCalibrationMenuItem
                     .opacity(isCalibrated ? 1.0 : flashingOpacity)
 
+                if appModel != nil {
+                    menuItem(
+                        icon: "viewfinder",
+                        title: "位姿采样",
+                        subtitle: "静态标定 · 本地保存",
+                        isExpanded: false,
+                        accentColor: .cyan
+                    ) {
+                        showPoseSamplingSheet = true
+                    }
+                }
             }
             
             // Teleop-only menu items

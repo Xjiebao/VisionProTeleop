@@ -1148,7 +1148,8 @@ struct CombinedStreamingView: View {
                 ),
                 previewStatusPosition: $previewStatusPosition,
                 previewStatusActive: $previewStatusActive,
-                mujocoManager: mujocoManager
+                mujocoManager: mujocoManager,
+                appModel: appModel
             )
         }
         
