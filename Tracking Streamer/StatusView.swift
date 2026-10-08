@@ -8,6 +8,125 @@ import GRPCProtobuf
 import PhotosUI
 import UniformTypeIdentifiers
 
+/// Kept inline because system sheets do not present reliably in the immersive panel.
+struct BoardCaptureConfirmationView: View {
+    @ObservedObject private var recordingManager = RecordingManager.shared
+
+    var body: some View {
+        if let pending = recordingManager.pendingBoardConfirmation {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("本轮已暂存，选择保存或放弃").font(.headline)
+                Text("轮次：\(pending.sessionID)").font(.callout.monospaced())
+                Text("保存后自动上传；放弃仅标记作废，VP 和板端已有文件均保留。")
+                    .font(.footnote).foregroundStyle(.secondary)
+                HStack {
+                    Button("保存本轮") { recordingManager.confirmBoardCapture(keep: true) }
+                        .buttonStyle(.borderedProminent)
+                    Button("放弃本轮") { recordingManager.confirmBoardCapture(keep: false) }
+                        .buttonStyle(.bordered)
+                }
+                .disabled(recordingManager.isBoardOperationInProgress)
+                if recordingManager.isBoardOperationInProgress { ProgressView("正在确认…") }
+                if let error = recordingManager.recordingError {
+                    Text(error).font(.footnote).foregroundStyle(.orange)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+}
+
+struct BoardStorageWarningView: View {
+    @ObservedObject private var captureBoard = CaptureBoardClient.shared
+
+    var body: some View {
+        if let warning = captureBoard.lastStatus?.storageWarning {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("采集板空间不足", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                Text(warning).font(.callout)
+            }
+            .foregroundStyle(.orange)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange.opacity(0.5)))
+        }
+    }
+}
+
+struct BoardTransferStatusView: View {
+    var showRetryButton = true
+    @ObservedObject private var captureBoard = CaptureBoardClient.shared
+    @ObservedObject private var recordingManager = RecordingManager.shared
+
+    private var isVisible: Bool {
+        if case .idle = captureBoard.uploadState {
+            return recordingManager.pendingBoardUploadCount > 0 || recordingManager.boardUploadError != nil
+        }
+        return true
+    }
+
+    private var isTransferring: Bool {
+        switch captureBoard.uploadState {
+        case .uploading: return true
+        default: return false
+        }
+    }
+
+    private var presentation: (title: String, icon: String, color: Color) {
+        switch captureBoard.uploadState {
+        case .idle: return ("VP 文件待传输", "clock.fill", .orange)
+        case .uploading: return ("正在传输 VP 文件", "arrow.up.circle.fill", .blue)
+        case .completed: return ("传输成功", "checkmark.circle.fill", .green)
+        case .failed: return ("传输未完成", "exclamationmark.triangle.fill", .orange)
+        }
+    }
+
+    var body: some View {
+        if isVisible {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Label(presentation.title, systemImage: presentation.icon)
+                        .font(.headline)
+                        .foregroundStyle(presentation.color)
+                    if isTransferring { ProgressView().controlSize(.small) }
+                }
+                if let sessionID = captureBoard.uploadSessionID {
+                    Text("轮次：\(sessionID)").font(.callout.monospaced())
+                }
+                switch captureBoard.uploadState {
+                case .completed:
+                    Text("采集板已确认收到上述轮次的全部 VP 文件。")
+                        .font(.callout)
+                case .idle:
+                    Text(recordingManager.boardUploadError ?? "等待连接采集板，VP 原件仍保留。")
+                        .font(.callout).foregroundStyle(.orange)
+                case .failed:
+                    Text(recordingManager.boardUploadError ?? captureBoard.uploadStatus)
+                        .font(.callout).foregroundStyle(.orange)
+                    Text("VP 原件仍保留，可重试传输。")
+                        .font(.footnote)
+                default:
+                    Text(captureBoard.uploadStatus).font(.callout)
+                }
+                if showRetryButton && recordingManager.pendingBoardUploadCount > 0 && !isTransferring {
+                    Button("重试传输（\(recordingManager.pendingBoardUploadCount) 轮）") {
+                        recordingManager.resumeBoardTransfers()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(presentation.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(presentation.color.opacity(0.5)))
+        }
+    }
+}
+
 /// Protocol for MuJoCo manager to allow StatusOverlay to display status
 @MainActor
 protocol MuJoCoManager: ObservableObject {
@@ -93,6 +212,7 @@ struct StatusOverlay: View {
     @ObservedObject var dataManager = DataManager.shared
     @ObservedObject private var uvcCameraManager = UVCCameraManager.shared
     @ObservedObject private var recordingManager = RecordingManager.shared
+    @ObservedObject private var captureBoard = CaptureBoardClient.shared
     @State private var ipAddresses: [(name: String, address: String)] = []
     @State private var pythonConnected: Bool = false
     @State private var pythonIP: String = "Not connected"
@@ -138,14 +258,14 @@ struct StatusOverlay: View {
     var body: some View {
         return ZStack {
             Group {
-                if isMinimized {
+                if isMinimized && recordingManager.pendingBoardConfirmation == nil {
                     minimizedView
                 } else {
                     expandedView
                 }
             }
             .animation(.spring(response: 0.45, dampingFraction: 0.85), value: isMinimized)
-            
+
             // Calibration overlay
             if showCalibrationSheet {
                 CameraCalibrationView(onDismiss: {
@@ -191,6 +311,21 @@ struct StatusOverlay: View {
                     progress: dataManager.pythonCalibrationProgress,
                     stepStatus: dataManager.pythonCalibrationStepStatus
                 )
+            }
+        }
+        .task(id: captureBoard.selectedBoardID) {
+            while !Task.isCancelled {
+                // Recording and calibration already refresh board status every two seconds.
+                if captureBoard.selectedBoard != nil,
+                   !recordingManager.hasBoardCapture, !recordingManager.isBoardOperationInProgress {
+                    do {
+                        _ = try await captureBoard.status()
+                    } catch {
+                        // The client reports network errors separately from storage warnings.
+                        if Task.isCancelled { return }
+                    }
+                }
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
             }
         }
         .onAppear {
@@ -283,6 +418,11 @@ struct StatusOverlay: View {
     
     private var minimizedView: some View {
         VStack(spacing: 12) {
+            BoardStorageWarningView()
+                .frame(width: 340)
+            BoardTransferStatusView(showRetryButton: false)
+                .frame(width: 340)
+
             // Recording timer (show above buttons when recording)
             if recordingManager.isRecording {
                 HStack(spacing: 8) {
@@ -1370,6 +1510,8 @@ struct StatusOverlay: View {
             HStack {
                 Spacer()
                 modeToggleSection
+                    .disabled(recordingManager.isRecording || recordingManager.isSaving || recordingManager.hasBoardCapture ||
+                              recordingManager.isBoardOperationInProgress || recordingManager.pendingBoardConfirmation != nil)
                 Spacer()
             }
             
@@ -1454,142 +1596,12 @@ struct StatusOverlay: View {
             }
             .buttonStyle(.plain)
             
-            // Egorecord mode: Start Recording button with requirement checks
             if appMode == .egorecord {
-                Divider()
-                    .background(Color.white.opacity(0.3))
-                
-                // Check requirements
-                let hasIntrinsic = uvcCameraManager.selectedDevice.map { calibrationManager.hasCalibration(for: $0.id) } ?? false
-                let hasExtrinsic = uvcCameraManager.selectedDevice.map { extrinsicCalibrationManager.hasCalibration(for: $0.id) } ?? false
-                let isCalibrated = hasIntrinsic && hasExtrinsic
-                
-                // Cloud storage configured check (only for non-iCloud providers)
-                let isCloudConfigured: Bool = {
-                    if recordingManager.storageLocation == .local { return true }
-                    switch recordingManager.cloudProvider {
-                    case .iCloudDrive: return true
-                    case .dropbox: return cloudStorageSettings.isDropboxAvailable
-                    case .googleDrive: return cloudStorageSettings.isGoogleDriveAvailable
-                    }
-                }()
-                
-                let canRecord = isCalibrated && isCloudConfigured && uvcCameraManager.selectedDevice != nil
-                
-                // Allow recording without full requirements (hand-tracking only mode)
-                // Users can always record hand tracking data, even without camera or calibration
-                let canRecordHandTrackingOnly = isCloudConfigured
-                
-                // Requirement indicators (warnings, not blockers)
-                if !canRecord {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if !isCalibrated && uvcCameraManager.selectedDevice != nil {
-                            HStack(spacing: 6) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                                Text("Camera calibration required for video")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                            }
-                            .opacity(flashingOpacity)
-                        }
-                        if !isCloudConfigured {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "icloud.slash.fill")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    Text("\(recordingManager.cloudProvider.displayName) not configured")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                }
-                                .opacity(flashingOpacity)
-                                
-                                // Show Google Drive sign-in button if Google Drive is selected
-                                if recordingManager.cloudProvider == .googleDrive {
-                                    Button {
-                                        // Minimize status view so OAuth window is visible
-                                        // Set directly first, then animate
-                                        expandedPanel = .none
-                                        isMinimized = true
-                                        userInteracted = true
-                                        
-                                        Task {
-                                            // Delay to let UI update and minimize
-                                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-                                            await GoogleDriveAuthManager.shared.startOAuthFlow()
-                                            // Restore after OAuth completes
-                                            await MainActor.run {
-                                                isMinimized = false
-                                            }
-                                        }
-                                    } label: {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "person.crop.circle.badge.plus")
-                                                .font(.caption)
-                                            Text("Sign in to Google Drive")
-                                                .font(.caption)
-                                                .fontWeight(.medium)
-                                        }
-                                        .foregroundColor(.white)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(Color.blue)
-                                        .cornerRadius(8)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .padding(.top, 4)
-                                }
-                            }
-                        }
-                        if uvcCameraManager.selectedDevice == nil {
-                            HStack(spacing: 6) {
-                                Image(systemName: "video.slash.fill")
-                                    .font(.caption)
-                                    .foregroundColor(.yellow)
-                                Text("No USB camera - hand tracking only")
-                                    .font(.caption)
-                                    .foregroundColor(.yellow)
-                            }
-                        }
-                    }
-                    .padding(.vertical, 6)
-                }
-                
-                // Start Recording button
-                Button {
-                    if !recordingManager.isRecording {
-                        recordingManager.startRecording()
-                        // Auto-minimize and hide video in egorecord mode
-                        withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
-                            isMinimized = true
-                            videoMinimized = true
-                            userInteracted = true
-                        }
-                    } else {
-                        recordingManager.stopRecordingManually()
-                    }
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: recordingManager.isRecording ? "stop.fill" : "record.circle.fill")
-                            .font(.system(size: 20, weight: .bold))
-                        Text(recordingManager.isRecording ? "Stop Recording" : "Start Recording")
-                            .font(.headline)
-                            .fontWeight(.bold)
-                    }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(
-                        recordingManager.isRecording 
-                            ? Color.red
-                            : (canRecordHandTrackingOnly ? Color.red.opacity(0.9) : Color.gray.opacity(0.5))
-                    )
-                    .cornerRadius(12)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canRecordHandTrackingOnly && !recordingManager.isRecording)
+                Divider().background(Color.white.opacity(0.3))
+                boardCaptureControls
+            } else if recordingManager.pendingBoardConfirmation != nil {
+                Divider().background(Color.white.opacity(0.3))
+                BoardCaptureConfirmationView()
             }
 
         }
@@ -1599,6 +1611,63 @@ struct StatusOverlay: View {
         .cornerRadius(16)
     }
     
+    private var boardCaptureControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            BoardStorageWarningView()
+            Label(captureBoard.connectionStatus, systemImage: "network")
+                .font(.subheadline)
+            if !captureBoard.boards.isEmpty {
+                Picker("采集板", selection: $captureBoard.selectedBoardID) {
+                    Text("选择采集板").tag(String?.none)
+                    ForEach(captureBoard.boards) { board in
+                        Text(board.name).tag(Optional(board.id))
+                    }
+                }
+                .disabled(recordingManager.hasBoardCapture || recordingManager.isBoardOperationInProgress ||
+                          recordingManager.pendingBoardConfirmation != nil)
+            }
+            HStack {
+                Button("重新搜索") { captureBoard.refreshDiscovery() }
+                    .disabled(recordingManager.isBoardOperationInProgress)
+                Button("检测延迟 / 对钟") { recordingManager.checkBoardClock() }
+                    .disabled(captureBoard.selectedBoard == nil || recordingManager.hasBoardCapture || recordingManager.isBoardOperationInProgress)
+            }
+            .buttonStyle(.bordered)
+            Text(recordingManager.boardClockSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(recordingManager.boardCaptureStatus)
+                .font(.subheadline)
+            if let error = recordingManager.recordingError, recordingManager.pendingBoardConfirmation == nil {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            Button {
+                if recordingManager.hasBoardCapture || recordingManager.isRecording {
+                    recordingManager.stopRecordingManually()
+                } else {
+                    recordingManager.startRecording()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: recordingManager.hasBoardCapture ? "stop.fill" : "record.circle.fill")
+                    Text(recordingManager.hasBoardCapture ? "结束采集" : "开始采集")
+                        .font(.headline)
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Color.red)
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            .disabled(recordingManager.isSaving || (!recordingManager.hasBoardCapture &&
+                (captureBoard.selectedBoard == nil || recordingManager.isBoardOperationInProgress ||
+                 recordingManager.pendingBoardConfirmation != nil)))
+            BoardCaptureConfirmationView()
+            BoardTransferStatusView()
+        }
+    }
+
     private func menuItem(icon: String, title: String, subtitle: String?, isExpanded: Bool, accentColor: Color, iconColor: Color? = nil, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
@@ -1778,6 +1847,7 @@ struct StatusOverlay: View {
                 
                 cameraCalibrationMenuItem
                     .opacity(isCalibrated ? 1.0 : flashingOpacity)
+
             }
             
             // Teleop-only menu items
@@ -1902,7 +1972,11 @@ struct StatusOverlay: View {
             case .cameraCalibration:
                 cameraCalibrationPanelContent
             case .cloudStorageDebug:
-                cloudStorageDebugPanelContent
+                if CloudStorageSettings.isEnabled {
+                    cloudStorageDebugPanelContent
+                } else {
+                    Text("Recordings are saved on this device.")
+                }
             case .visualizations:
                 visualizationsPanelContent
             case .handTracking:
@@ -2495,48 +2569,50 @@ struct StatusOverlay: View {
                                 recordingManager.storageLocation = .local
                             }
                             
-                            storageOptionRow(
-                                icon: "icloud.fill",
-                                label: "iCloud Drive",
-                                description: "Sync across your Apple devices",
-                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .iCloudDrive,
-                                color: .blue
-                            ) {
-                                recordingManager.storageLocation = .cloud
-                                recordingManager.cloudProvider = .iCloudDrive
-                                KeychainManager.shared.save(CloudStorageProvider.iCloudDrive.rawValue, forKey: .selectedCloudProvider)
-                            }
-                            
-                            storageOptionRow(
-                                icon: "g.circle.fill",
-                                label: "Google Drive",
-                                description: cloudStorageSettings.isGoogleDriveAvailable ? "Upload to your Google account" : "Sign in required",
-                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive,
-                                color: Color(red: 0.26, green: 0.52, blue: 0.96),
-                                showWarning: !cloudStorageSettings.isGoogleDriveAvailable
-                            ) {
-                                recordingManager.storageLocation = .cloud
-                                recordingManager.cloudProvider = .googleDrive
-                                KeychainManager.shared.save(CloudStorageProvider.googleDrive.rawValue, forKey: .selectedCloudProvider)
-                            }
-                            
-                            storageOptionRow(
-                                icon: "shippingbox.fill",
-                                label: "Dropbox",
-                                description: cloudStorageSettings.isDropboxAvailable ? "Upload to your Dropbox account" : "Sign in required",
-                                isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .dropbox,
-                                color: Color(red: 0, green: 0.4, blue: 1),
-                                showWarning: !cloudStorageSettings.isDropboxAvailable
-                            ) {
-                                recordingManager.storageLocation = .cloud
-                                recordingManager.cloudProvider = .dropbox
-                                KeychainManager.shared.save(CloudStorageProvider.dropbox.rawValue, forKey: .selectedCloudProvider)
+                            if CloudStorageSettings.isEnabled {
+                                storageOptionRow(
+                                    icon: "icloud.fill",
+                                    label: "iCloud Drive",
+                                    description: "Sync across your Apple devices",
+                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .iCloudDrive,
+                                    color: .blue
+                                ) {
+                                    recordingManager.storageLocation = .cloud
+                                    recordingManager.cloudProvider = .iCloudDrive
+                                    KeychainManager.shared.save(CloudStorageProvider.iCloudDrive.rawValue, forKey: .selectedCloudProvider)
+                                }
+
+                                storageOptionRow(
+                                    icon: "g.circle.fill",
+                                    label: "Google Drive",
+                                    description: cloudStorageSettings.isGoogleDriveAvailable ? "Upload to your Google account" : "Sign in required",
+                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive,
+                                    color: Color(red: 0.26, green: 0.52, blue: 0.96),
+                                    showWarning: !cloudStorageSettings.isGoogleDriveAvailable
+                                ) {
+                                    recordingManager.storageLocation = .cloud
+                                    recordingManager.cloudProvider = .googleDrive
+                                    KeychainManager.shared.save(CloudStorageProvider.googleDrive.rawValue, forKey: .selectedCloudProvider)
+                                }
+
+                                storageOptionRow(
+                                    icon: "shippingbox.fill",
+                                    label: "Dropbox",
+                                    description: cloudStorageSettings.isDropboxAvailable ? "Upload to your Dropbox account" : "Sign in required",
+                                    isSelected: recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .dropbox,
+                                    color: Color(red: 0, green: 0.4, blue: 1),
+                                    showWarning: !cloudStorageSettings.isDropboxAvailable
+                                ) {
+                                    recordingManager.storageLocation = .cloud
+                                    recordingManager.cloudProvider = .dropbox
+                                    KeychainManager.shared.save(CloudStorageProvider.dropbox.rawValue, forKey: .selectedCloudProvider)
+                                }
                             }
                         }
                     }
                     
                     // Sign-in prompt for Google Drive
-                    if recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive && !cloudStorageSettings.isGoogleDriveAvailable {
+                    if CloudStorageSettings.isEnabled && recordingManager.storageLocation == .cloud && recordingManager.cloudProvider == .googleDrive && !cloudStorageSettings.isGoogleDriveAvailable {
                         Button {
                             expandedPanel = .none
                             isMinimized = true

@@ -68,10 +68,11 @@
 	<!-- Multipeer Connectivity / Bonjour Services -->
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_egocapture._tcp</string>
 		<string>_vp-calibrate._tcp</string>
 		<string>_vp-calibrate._udp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>This app uses the local network to communicate with iPhone for real-time calibration synchronization.</string>
+	<string>用于自动发现采集板、控制录制与对钟、传输采集文件，以及与电脑和 iPhone 通信。</string>
 </dict>
 </plist>

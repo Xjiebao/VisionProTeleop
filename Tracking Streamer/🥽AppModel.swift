@@ -593,6 +593,7 @@ extension 🥽AppModel {
     }
 
     func stop() {
+        RecordingManager.shared.trackingDidStop()
         trackingTask?.cancel()
         trackingTask = nil
         handRecordingTask?.cancel()

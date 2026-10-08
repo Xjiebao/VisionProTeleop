@@ -70,6 +70,8 @@
 		C1EAFABB2EE0CB1700549580 /* MultipeerCalibrationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1EAFABA2EE0CB1700549580 /* MultipeerCalibrationManager.swift */; };
 		C1EAFABF2EE11B5D00549580 /* CameraCalibrationWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1EAFABE2EE11B5D00549580 /* CameraCalibrationWizardView.swift */; };
 		C2A091110000000000000002 /* PoseCalibrationSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A091110000000000000001 /* PoseCalibrationSession.swift */; };
+		C2A091180000000000000002 /* CaptureBoardClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A091180000000000000001 /* CaptureBoardClient.swift */; };
+		C2A091150000000000000002 /* ClockSyncServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A091150000000000000001 /* ClockSyncServer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -154,6 +156,8 @@
 		C1EAFABA2EE0CB1700549580 /* MultipeerCalibrationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultipeerCalibrationManager.swift; sourceTree = "<group>"; };
 		C1EAFABE2EE11B5D00549580 /* CameraCalibrationWizardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraCalibrationWizardView.swift; sourceTree = "<group>"; };
 		C2A091110000000000000001 /* PoseCalibrationSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PoseCalibrationSession.swift; sourceTree = "<group>"; };
+		C2A091180000000000000001 /* CaptureBoardClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureBoardClient.swift; sourceTree = "<group>"; };
+		C2A091150000000000000001 /* ClockSyncServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClockSyncServer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -258,6 +262,8 @@
 				C1E05F7A2ECD850B0018C506 /* ImmersiveView.swift */,
 				C1E05F7B2ECD850B0018C506 /* WebRTCClient.swift */,
 				C2A091110000000000000001 /* PoseCalibrationSession.swift */,
+				C2A091180000000000000001 /* CaptureBoardClient.swift */,
+				C2A091150000000000000001 /* ClockSyncServer.swift */,
 				C1EAF97E2EDBB9C700549580 /* RecordingManager.swift */,
 				C1EAFA822EDF476A00549580 /* CloudStorageProvider.swift */,
 				C1EAFABA2EE0CB1700549580 /* MultipeerCalibrationManager.swift */,
@@ -500,6 +506,8 @@
 				C1EAFA872EDF477900549580 /* KeychainManager.swift in Sources */,
 				C1EAF9742ED7E66600549580 /* mujoco_ar.pb.swift in Sources */,
 				C2A091110000000000000002 /* PoseCalibrationSession.swift in Sources */,
+				C2A091180000000000000002 /* CaptureBoardClient.swift in Sources */,
+				C2A091150000000000000002 /* ClockSyncServer.swift in Sources */,
 				C1EAF97F2EDBB9C700549580 /* RecordingManager.swift in Sources */,
 				C14B98BC2EECB747000B78D8 /* CalibrationDebugRecorder.swift in Sources */,
 				C1EAF9752ED7E66600549580 /* mujoco_ar.grpc.swift in Sources */,

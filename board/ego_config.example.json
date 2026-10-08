@@ -1,0 +1,5 @@
+{
+  "intrinsics": "calibration/stereo_calibration.json",
+  "calibration": "calibration/ego_extrinsics.json",
+  "camera_unique_id": null
+}

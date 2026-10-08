@@ -2,14 +2,28 @@ import SwiftUI
 
 @main
 struct VisionProTeleopApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var imageData = ImageData()
     @StateObject private var appModel = 🥽AppModel()
+    @StateObject private var captureBoard = CaptureBoardClient.shared
     
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
         .windowResizability(.contentSize)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                RecordingManager.shared.startClockSync()
+                captureBoard.refreshDiscovery()
+                RecordingManager.shared.resumeBoardTransfers()
+            } else if phase == .background {
+                RecordingManager.shared.trackingDidStop()
+            }
+        }
+        .onChange(of: captureBoard.boards) { _, _ in
+            RecordingManager.shared.resumeBoardTransfers()
+        }
         
         // Hand tracking view (existing)
         ImmersiveSpace(id: "immersiveSpace") {
@@ -39,6 +53,13 @@ struct VisionProTeleopApp: App {
         🧑HeadTrackingComponent.registerComponent()
         🧑HeadTrackingSystem.registerSystem()
         
+        // The clock responder belongs to the app, independent of recording and views.
+        Task { @MainActor in
+            RecordingManager.shared.startClockSync()
+            CaptureBoardClient.shared.startDiscovery()
+            RecordingManager.shared.resumeBoardTransfers()
+        }
+
         // Start gRPC server immediately when app launches
         dlog("🌐 [DEBUG] Starting gRPC server on app launch...")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -58,4 +79,3 @@ struct VisionProTeleopApp: App {
         }
     }
 }
-

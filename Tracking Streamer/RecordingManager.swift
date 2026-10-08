@@ -151,11 +151,13 @@ struct RecordingMetadata: Codable {
     let intrinsicCalibration: [String: Any]?
     let extrinsicCalibration: [String: Any]?
     let poseData: [String: String]?  // Source pose timing contract; alignment is not yet validated
+    let captureSessionID: String?
+    let captureBoardID: String?
     
     enum CodingKeys: String, CodingKey {
         case version, createdAt, duration, frameCount, hasVideo
         case hasLeftHand, hasRightHand, hasSimulationData, hasUSDZ, videoSource, averageFPS, deviceInfo
-        case intrinsicCalibration, extrinsicCalibration, recordingType, poseData
+        case intrinsicCalibration, extrinsicCalibration, recordingType, poseData, captureSessionID, captureBoardID
     }
     
     func encode(to encoder: Encoder) throws {
@@ -174,6 +176,8 @@ struct RecordingMetadata: Codable {
         try container.encode(averageFPS, forKey: .averageFPS)
         try container.encode(deviceInfo, forKey: .deviceInfo)
         try container.encodeIfPresent(poseData, forKey: .poseData)
+        try container.encodeIfPresent(captureSessionID, forKey: .captureSessionID)
+        try container.encodeIfPresent(captureBoardID, forKey: .captureBoardID)
         // Encode intrinsic calibration as JSON data
         if let intrinsic = intrinsicCalibration {
             let jsonData = try JSONSerialization.data(withJSONObject: intrinsic, options: [])
@@ -204,6 +208,8 @@ struct RecordingMetadata: Codable {
         averageFPS = try container.decode(Double.self, forKey: .averageFPS)
         deviceInfo = try container.decode(DeviceInfo.self, forKey: .deviceInfo)
         poseData = try container.decodeIfPresent([String: String].self, forKey: .poseData)
+        captureSessionID = try container.decodeIfPresent(String.self, forKey: .captureSessionID)
+        captureBoardID = try container.decodeIfPresent(String.self, forKey: .captureBoardID)
         // Decode intrinsic calibration from JSON string
         if let jsonString = try container.decodeIfPresent(String.self, forKey: .intrinsicCalibration),
            let jsonData = jsonString.data(using: .utf8),
@@ -224,7 +230,8 @@ struct RecordingMetadata: Codable {
     
     init(createdAt: Date, duration: Double, frameCount: Int, hasVideo: Bool, hasLeftHand: Bool,
          hasRightHand: Bool, hasSimulationData: Bool, hasUSDZ: Bool, videoSource: String, averageFPS: Double,
-         deviceInfo: DeviceInfo, recordingType: RecordingType, intrinsicCalibration: [String: Any]? = nil, extrinsicCalibration: [String: Any]? = nil, poseData: [String: String]? = nil) {
+         deviceInfo: DeviceInfo, recordingType: RecordingType, intrinsicCalibration: [String: Any]? = nil, extrinsicCalibration: [String: Any]? = nil, poseData: [String: String]? = nil,
+         captureSessionID: String? = nil, captureBoardID: String? = nil) {
         self.createdAt = createdAt
         self.duration = duration
         self.frameCount = frameCount
@@ -240,6 +247,8 @@ struct RecordingMetadata: Codable {
         self.intrinsicCalibration = intrinsicCalibration
         self.extrinsicCalibration = extrinsicCalibration
         self.poseData = poseData
+        self.captureSessionID = captureSessionID
+        self.captureBoardID = captureBoardID
     }
 }
 
@@ -277,6 +286,26 @@ struct VideoFrameData {
     let presentationTime: CMTime
 }
 
+private struct PendingBoardUpload: Codable {
+    let folderName: String
+    let sessionID: String
+    let boardID: String
+}
+
+struct PendingBoardConfirmation: Codable {
+    let sessionID: String
+    let boardID: String
+    let folderName: String?
+}
+
+private enum BoardCaptureError: LocalizedError {
+    case message(String)
+    var errorDescription: String? {
+        if case let .message(text) = self { return text }
+        return nil
+    }
+}
+
 // MARK: - Recording Manager
 
 /// Manages synchronized recording of tracking data and video frames.
@@ -298,6 +327,15 @@ class RecordingManager: ObservableObject {
     @Published var lastRecordingURL: URL? = nil
     @Published var recordingError: String? = nil
     @Published var isSaving: Bool = false
+    @Published private(set) var clockSyncStatus = "电脑对钟正在启动…"
+    @Published private(set) var isBoardOperationInProgress = false
+    @Published private(set) var boardCaptureStatus = "等待连接采集板"
+    @Published private(set) var boardClockSummary = "尚未检测网络延迟与钟差"
+    @Published private(set) var captureSessionID: String? = nil
+    @Published private(set) var pendingBoardUploadCount = 0
+    @Published private(set) var pendingBoardConfirmation: PendingBoardConfirmation? = nil
+    @Published private(set) var boardUploadError: String? = nil
+
     // Cloud storage (synced from iOS companion app)
     @Published var cloudProvider: CloudStorageProvider = .iCloudDrive
     @Published var isUploadingToCloud: Bool = false
@@ -325,6 +363,18 @@ class RecordingManager: ObservableObject {
     private var isEgoRecording = false  // Freeze the mode at recording start
     private var egoPoseSamples: [EgoPoseSample] = []  // MainActor-owned immutable source samples
     private var egoSequenceNumber = 0
+    private let clockSyncServer = ClockSyncServer()
+    private var captureBoardID: String?
+    private var boardCaptureWarning: String?
+    private var boardStopRequested = false
+    private var localSaveTask: Task<Void, Never>?
+    private var boardMonitorTask: Task<Void, Never>?
+    private var boardUploadTask: Task<Void, Never>?
+    private var pendingBoardUploads: [PendingBoardUpload] = []
+
+    private var isChoosingBoardSessionID = false
+    var hasBoardCapture: Bool { captureSessionID != nil || isChoosingBoardSessionID }
+
     var isRecordingEgoPoses: Bool { isRecording && isEgoRecording }
     private var durationTimer: Timer?
     private var sessionID: String = ""
@@ -369,6 +419,24 @@ class RecordingManager: ObservableObject {
         }
         // Load auto-recording preference (default to true for auto-record by default)
         self.autoRecordingEnabled = UserDefaults.standard.object(forKey: "autoRecordingEnabled") as? Bool ?? true
+        captureSessionID = UserDefaults.standard.string(forKey: "captureSessionID")
+        captureBoardID = UserDefaults.standard.string(forKey: "activeCaptureBoardID")
+        if let data = UserDefaults.standard.data(forKey: "pendingBoardUploads"),
+           let pending = try? JSONDecoder().decode([PendingBoardUpload].self, from: data) {
+            pendingBoardUploads = pending
+            pendingBoardUploadCount = pending.count
+        }
+        if let data = UserDefaults.standard.data(forKey: "pendingBoardConfirmation"),
+           let pending = try? JSONDecoder().decode(PendingBoardConfirmation.self, from: data) {
+            pendingBoardConfirmation = pending
+            if captureSessionID == pending.sessionID && captureBoardID == pending.boardID {
+                clearBoardCapture()
+            }
+            boardCaptureStatus = "本轮文件已保留，请选择保存或放弃"
+        } else if captureSessionID != nil {
+            boardCaptureStatus = "有未确认结束的采集，请连接原采集板后重试结束"
+        }
+
         // The background video writer reads this preference directly.
         UserDefaults.standard.set(storageLocation.rawValue, forKey: "recordingStorageLocation")
         
@@ -427,7 +495,7 @@ class RecordingManager: ObservableObject {
     
     /// Explicitly stop recording (user action). This also clears auto-recording state.
     func stopRecordingManually() {
-        guard isRecording else { return }
+        guard isRecording || hasBoardCapture else { return }
         
         dlog("🔴 [RecordingManager] User manually stopped recording")
         userManuallyStopped = true // Prevent immediate auto-restart
@@ -435,15 +503,376 @@ class RecordingManager: ObservableObject {
         isAutoRecording = false
     }
     
+    // MARK: - Independent Clock Sync Control
+
+    func startClockSync() {
+        clockSyncServer.start { [weak self] status in
+            self?.clockSyncStatus = status
+        }
+    }
+
+    func restartClockSync() {
+        clockSyncServer.stop()
+        startClockSync()
+    }
+
+    // MARK: - External Capture Board
+
+    func checkBoardClock() {
+        guard !isBoardOperationInProgress, !hasBoardCapture else { return }
+        isBoardOperationInProgress = true
+        recordingError = nil
+        startClockSync()
+        Task {
+            defer { isBoardOperationInProgress = false }
+            do {
+                let status = try await CaptureBoardClient.shared.checkClock()
+                showBoardClock(status)
+            } catch {
+                recordingError = "延迟检测失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func showBoardClock(_ status: BoardStatus) {
+        guard let summary = status.syncSummary else { return }
+        boardClockSummary = String(format: "网络往返 %.2f ms · VP−板子钟差 %+.2f ms",
+                                   summary.networkRTTMS, summary.offsetVPMinusMacSeconds * 1000)
+    }
+
+    private func nextBoardSessionID(boardID: String) async throws -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyMMddHHmm"
+        let base = formatter.string(from: Date())
+        let storage = try getStorageURL()
+        var number = 1
+        while true {
+            if boardStopRequested { throw BoardCaptureError.message("采集已取消") }
+            let id = number == 1 ? base : "\(base)_\(String(format: "%02d", number))"
+            if !FileManager.default.fileExists(atPath: storage.appendingPathComponent(id).path) {
+                do {
+                    _ = try await CaptureBoardClient.shared.status(sessionID: id, boardID: boardID)
+                } catch let error as CaptureBoardError where error.statusCode == 404 {
+                    return id
+                }
+            }
+            number += 1
+        }
+    }
+
+    private func startBoardCapture() {
+        guard !isRecording, !isSaving, !isBoardOperationInProgress, !hasBoardCapture,
+              pendingBoardConfirmation == nil else { return }
+        guard let board = CaptureBoardClient.shared.selectedBoard else {
+            recordingError = "尚未找到采集板，请确认板子和 VP 已接入同一局域网。"
+            return
+        }
+        boardStopRequested = false
+        boardCaptureWarning = nil
+        isChoosingBoardSessionID = true
+        isBoardOperationInProgress = true
+        boardCaptureStatus = "准备采集、执行录前对钟…"
+        recordingError = nil
+        startClockSync()
+        Task {
+            do {
+                let id = try await nextBoardSessionID(boardID: board.id)
+                if boardStopRequested { throw BoardCaptureError.message("采集已取消") }
+                isChoosingBoardSessionID = false
+                captureSessionID = id
+                captureBoardID = board.id
+                UserDefaults.standard.set(id, forKey: "captureSessionID")
+                UserDefaults.standard.set(board.id, forKey: "activeCaptureBoardID")
+                let prepared = try await CaptureBoardClient.shared.prepare(sessionID: id, boardID: board.id)
+                showBoardClock(prepared)
+                if boardStopRequested { throw BoardCaptureError.message("采集已取消") }
+                startLocalRecording(captureSession: id)
+                boardCaptureStatus = "等待 VP 头部跟踪开始…"
+                let deadline = CACurrentMediaTime() + 3
+                while !egoPoseSamples.contains(where: { $0.source == "head" && $0.isTracked }) {
+                    if boardStopRequested { throw BoardCaptureError.message("采集已取消") }
+                    if CACurrentMediaTime() >= deadline {
+                        throw BoardCaptureError.message("VP 未产生有效头部数据，请保持采集视图开启并检查跟踪权限。")
+                    }
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                }
+                if boardStopRequested { throw BoardCaptureError.message("采集已取消") }
+                boardCaptureStatus = "VP 已开始，等待相机首帧…"
+                let running = try await CaptureBoardClient.shared.start(sessionID: id, boardID: board.id)
+                guard running.state == "recording" else {
+                    throw BoardCaptureError.message(running.error ?? "相机未确认开始录像")
+                }
+                boardCaptureStatus = "VP 与采集板正在录制"
+                monitorBoardCapture(sessionID: id, boardID: board.id)
+            } catch {
+                isChoosingBoardSessionID = false
+                recordingError = "开始采集失败：\(error.localizedDescription)"
+                boardCaptureWarning = recordingError
+                if captureSessionID == nil { boardCaptureStatus = "采集未启动" }
+                boardStopRequested = true
+            }
+            isBoardOperationInProgress = false
+            if boardStopRequested { await finishBoardCapture() }
+        }
+    }
+
+    private func monitorBoardCapture(sessionID id: String, boardID: String) {
+        boardMonitorTask?.cancel()
+        boardMonitorTask = Task {
+            while !Task.isCancelled && captureSessionID == id && !boardStopRequested {
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    if Task.isCancelled || boardStopRequested { return }
+                    let status = try await CaptureBoardClient.shared.status(sessionID: id, boardID: boardID)
+                    if status.state != "recording" {
+                        recordingError = status.error ?? "采集板录像已停止，正在保存 VP 数据。"
+                        boardCaptureWarning = recordingError
+                        requestBoardStop()
+                        return
+                    }
+                    boardCaptureStatus = "VP 与采集板正在录制"
+                } catch {
+                    if Task.isCancelled { return }
+                    boardCaptureStatus = "板子连接中断，录像状态未确认；VP 仍在本地采集"
+                }
+            }
+        }
+    }
+
+    private func requestBoardStop() {
+        boardStopRequested = true
+        guard !isBoardOperationInProgress else { return }
+        // Set the guard before creating the task, including when the user taps twice.
+        isBoardOperationInProgress = true
+        Task { await finishBoardCapture() }
+    }
+
+    /// Called before ARKit stops, and when the app enters the background.
+    func trackingDidStop() {
+        guard hasBoardCapture else { return }
+        recordingError = "跟踪已停止，正在结束采集；请在电脑检查轨迹覆盖范围。"
+        boardCaptureWarning = recordingError
+        // ARKit has already stopped producing data: save immediately even if the network is down.
+        stopLocalRecording()
+        requestBoardStop()
+    }
+
+    private func finishBoardCapture() async {
+        guard let id = captureSessionID, let boardID = captureBoardID else {
+            isBoardOperationInProgress = false
+            return
+        }
+        isBoardOperationInProgress = true
+        boardStopRequested = true
+        boardMonitorTask?.cancel()
+        boardMonitorTask = nil
+        boardCaptureStatus = "正在停止采集板并保存视频…"
+        defer {
+            isBoardOperationInProgress = false
+            resumeBoardTransfers()
+        }
+        var boardStopped = false
+        do {
+            let stopped = try await CaptureBoardClient.shared.stop(sessionID: id, boardID: boardID)
+            guard stopped.state == "saved" || stopped.state == "failed" else {
+                throw BoardCaptureError.message("板子仍未确认停止，请重试结束")
+            }
+            boardStopped = true
+            let wasRecording = isRecording
+            stopLocalRecording()
+            await localSaveTask?.value
+            if !wasRecording && !egoPoseSamples.isEmpty && lastRecordingURL?.lastPathComponent != id {
+                // An explicit retry of "结束" may retry a failed local save while its source samples remain.
+                isSaving = true
+                await saveRecording()
+            }
+            if recordingError == nil { recordingError = boardCaptureWarning }
+            let folder = try savedBoardRecording(sessionID: id)
+            if folder == nil && !egoPoseSamples.isEmpty {
+                throw BoardCaptureError.message("VP 文件保存失败；请重试结束以重新保存。")
+            }
+            if stopped.state == "saved" {
+                if folder == nil {
+                    recordingError = "板子视频已保存，但本轮缺少 VP 原始文件；该轮不完整。"
+                }
+                boardCaptureStatus = "采集已停止，正在录后对钟…"
+                let synced = try await CaptureBoardClient.shared.syncAfter(sessionID: id, boardID: boardID)
+                showBoardClock(synced)
+            } else {
+                if recordingError == nil { recordingError = stopped.error }
+            }
+            if let folder {
+                try markBoardRecording(folder: folder, sessionID: id, boardID: boardID, reviewState: "pending")
+            }
+            let pending = PendingBoardConfirmation(sessionID: id, boardID: boardID,
+                                                    folderName: folder?.lastPathComponent)
+            UserDefaults.standard.set(try JSONEncoder().encode(pending), forKey: "pendingBoardConfirmation")
+            pendingBoardConfirmation = pending
+            boardCaptureStatus = recordingError == nil
+                ? "本轮文件已保留，请选择保存或放弃"
+                : "本轮采集有异常，现有文件已保留，请选择保存或放弃"
+            clearBoardCapture()
+        } catch {
+            // A failed network stop must not discard VP data or claim that the camera stopped.
+            stopLocalRecording()
+            await localSaveTask?.value
+            if recordingError == nil { recordingError = boardCaptureWarning }
+            if !boardStopped, let requestError = error as? CaptureBoardError, requestError.statusCode == 404 {
+                clearBoardCapture()
+                boardCaptureStatus = "采集未启动"
+            } else {
+                boardCaptureStatus = "VP 已停止；本轮结束未完成，请重试结束"
+                recordingError = "结束采集失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func confirmBoardCapture(keep: Bool) {
+        guard let pending = pendingBoardConfirmation, !isBoardOperationInProgress else { return }
+        isBoardOperationInProgress = true
+        let decision = keep ? "kept" : "discarded"
+        boardCaptureStatus = keep ? "正在确认保存…" : "正在标记作废…"
+        Task {
+            defer { isBoardOperationInProgress = false }
+            do {
+                let status = try await CaptureBoardClient.shared.review(
+                    sessionID: pending.sessionID, boardID: pending.boardID, decision: decision)
+                guard status.reviewState == decision else {
+                    throw BoardCaptureError.message("板子尚未确认本轮处理结果")
+                }
+                if let folderName = pending.folderName {
+                    let folder = try getStorageURL().appendingPathComponent(folderName)
+                    try markBoardRecording(folder: folder, sessionID: pending.sessionID,
+                                           boardID: pending.boardID, reviewState: decision)
+                    if keep { enqueueBoardUpload(folder: folder, sessionID: pending.sessionID, boardID: pending.boardID) }
+                }
+                if !keep {
+                    pendingBoardUploads.removeAll {
+                        $0.sessionID == pending.sessionID && $0.boardID == pending.boardID
+                    }
+                    persistBoardUploads()
+                }
+                pendingBoardConfirmation = nil
+                UserDefaults.standard.removeObject(forKey: "pendingBoardConfirmation")
+                recordingError = nil
+                boardCaptureStatus = keep
+                    ? (pending.folderName == nil ? "已确认保留，但本轮缺少 VP 文件" : "本轮已确认保存")
+                    : "本轮已标记作废，所有现有文件仍保留"
+                resumeBoardTransfers()
+            } catch {
+                boardCaptureStatus = "本轮尚未确认，请重试保存或放弃"
+                recordingError = "确认\(keep ? "保存" : "放弃")失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func markBoardRecording(folder: URL, sessionID: String, boardID: String, reviewState: String) throws {
+        let metadataURL = folder.appendingPathComponent("metadata.json")
+        guard var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any],
+              metadata["captureSessionID"] as? String == sessionID,
+              metadata["captureBoardID"] as? String == boardID else {
+            throw BoardCaptureError.message("VP 文件的采集编号或板子身份不匹配")
+        }
+        guard metadata["reviewState"] as? String != reviewState else { return }
+        metadata["reviewState"] = reviewState
+        try JSONSerialization.data(withJSONObject: metadata, options: .prettyPrinted)
+            .write(to: metadataURL, options: .atomic)
+    }
+
+    private func clearBoardCapture() {
+        captureSessionID = nil
+        captureBoardID = nil
+        boardStopRequested = false
+        UserDefaults.standard.removeObject(forKey: "captureSessionID")
+        UserDefaults.standard.removeObject(forKey: "activeCaptureBoardID")
+    }
+
+    private func savedBoardRecording(sessionID id: String) throws -> URL? {
+        let folder = try getStorageURL().appendingPathComponent(id)
+        let metadata = folder.appendingPathComponent("metadata.json")
+        let tracking = folder.appendingPathComponent("tracking_events.jsonl")
+        guard FileManager.default.fileExists(atPath: metadata.path),
+              FileManager.default.fileExists(atPath: tracking.path) else { return nil }
+        let data = try JSONSerialization.jsonObject(with: Data(contentsOf: metadata)) as? [String: Any]
+        guard data?["captureSessionID"] as? String == id,
+              data?["captureBoardID"] as? String == captureBoardID else {
+            throw BoardCaptureError.message("VP 文件的采集编号或板子身份不匹配")
+        }
+        return folder
+    }
+
+    private func enqueueBoardUpload(folder: URL, sessionID: String, boardID: String) {
+        guard !pendingBoardUploads.contains(where: { $0.sessionID == sessionID && $0.boardID == boardID }) else { return }
+        pendingBoardUploads.append(PendingBoardUpload(folderName: folder.lastPathComponent, sessionID: sessionID, boardID: boardID))
+        persistBoardUploads()
+    }
+
+    private func persistBoardUploads() {
+        pendingBoardUploadCount = pendingBoardUploads.count
+        do {
+            UserDefaults.standard.set(try JSONEncoder().encode(pendingBoardUploads), forKey: "pendingBoardUploads")
+        } catch {
+            boardUploadError = "待传输列表保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func resumeBoardTransfers() {
+        guard boardUploadTask == nil, !pendingBoardUploads.isEmpty else { return }
+        boardUploadTask = Task {
+            defer { boardUploadTask = nil }
+            var deferredItems: [PendingBoardUpload] = []
+            while let item = pendingBoardUploads.first(where: { item in
+                !(pendingBoardConfirmation?.sessionID == item.sessionID
+                  && pendingBoardConfirmation?.boardID == item.boardID)
+                    && !deferredItems.contains { $0.sessionID == item.sessionID && $0.boardID == item.boardID }
+                    && CaptureBoardClient.shared.boards.contains { $0.id == item.boardID }
+            }) {
+                boardUploadError = nil
+                do {
+                    let folder = try getStorageURL().appendingPathComponent(item.folderName)
+                    let existing = try await CaptureBoardClient.shared.status(sessionID: item.sessionID, boardID: item.boardID)
+                    if (existing.state == "saved" || existing.state == "failed") && existing.reviewState == "pending" {
+                        if pendingBoardConfirmation == nil && !hasBoardCapture {
+                            try markBoardRecording(folder: folder, sessionID: item.sessionID,
+                                                   boardID: item.boardID, reviewState: "pending")
+                            let pending = PendingBoardConfirmation(sessionID: item.sessionID, boardID: item.boardID,
+                                                                   folderName: item.folderName)
+                            UserDefaults.standard.set(try JSONEncoder().encode(pending), forKey: "pendingBoardConfirmation")
+                            pendingBoardConfirmation = pending
+                            boardCaptureStatus = "已恢复上次采集，请选择保存或放弃"
+                        } else {
+                            deferredItems.append(item)
+                        }
+                        continue
+                    }
+                    let status = try await CaptureBoardClient.shared.uploadRecording(
+                        folder: folder, sessionID: item.sessionID, boardID: item.boardID)
+                    guard status.vpUploaded else { throw BoardCaptureError.message("板子尚未确认收到两份文件") }
+                    pendingBoardUploads.removeAll { $0.sessionID == item.sessionID && $0.boardID == item.boardID }
+                    persistBoardUploads()
+                } catch {
+                    CaptureBoardClient.shared.failUpload(sessionID: item.sessionID, error: error)
+                    boardUploadError = "传输未完成，原件保留在 VP：\(error.localizedDescription)"
+                    return
+                }
+            }
+        }
+    }
+
     // MARK: - Recording Control
     
     func startRecording() {
+        guard pendingBoardConfirmation == nil else { return }
+        if UserDefaults.standard.string(forKey: "appMode") == "egorecord" {
+            startBoardCapture()
+            return
+        }
         startLocalRecording()
     }
 
-    private func startLocalRecording() {
+    private func startLocalRecording(captureSession: String? = nil) {
         guard !isRecording, !isSaving else { return }
-        isEgoRecording = UserDefaults.standard.string(forKey: "appMode") == "egorecord"
+        isEgoRecording = captureSession != nil || UserDefaults.standard.string(forKey: "appMode") == "egorecord"
         egoPoseSamples.removeAll()
         egoSequenceNumber = 0
         
@@ -473,7 +902,7 @@ class RecordingManager: ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         let uuidShort = UUID().uuidString.prefix(4)
-        sessionID = "recording_\(formatter.string(from: Date()))_\(uuidShort)"
+        sessionID = captureSession ?? "recording_\(formatter.string(from: Date()))_\(uuidShort)"
         
         isRecording = true
         
@@ -618,6 +1047,10 @@ class RecordingManager: ObservableObject {
     }
     
     func stopRecording() {
+        if hasBoardCapture {
+            requestBoardStop()
+            return
+        }
         stopLocalRecording()
     }
 
@@ -649,7 +1082,7 @@ class RecordingManager: ObservableObject {
         // Block a new recording before the asynchronous save can yield and release its buffers.
         isSaving = true
         // Save the recording
-        Task {
+        localSaveTask = Task {
             await saveRecording()
         }
     }
@@ -1263,7 +1696,9 @@ class RecordingManager: ObservableObject {
                     "translationUnit": "meters",
                     "handPoseSource": "anchorUpdates",
                     "headPoseSource": "queryDeviceAnchor_current_time"
-                ] : nil
+                ] : nil,
+                captureSessionID: isEgoRecording ? captureSessionID : nil,
+                captureBoardID: isEgoRecording ? captureBoardID : nil
             )
             
             let metadataURL = recordingFolder.appendingPathComponent("metadata.json")
@@ -1342,7 +1777,9 @@ class RecordingManager: ObservableObject {
                 recordingType: metadata.recordingType,
                 intrinsicCalibration: metadata.intrinsicCalibration,
                 extrinsicCalibration: metadata.extrinsicCalibration,
-                poseData: metadata.poseData
+                poseData: metadata.poseData,
+                captureSessionID: metadata.captureSessionID,
+                captureBoardID: metadata.captureBoardID
             )
             
             // Re-save metadata with updated flags
