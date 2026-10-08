@@ -606,158 +606,24 @@ struct StatusOverlay: View {
                 )
             }
             
-            HStack(spacing: 16) {
-                if showLocalExitConfirmation {
-                    // Confirmation mode with upload warning
-                    VStack(spacing: 8) {
-                        if recordingManager.isUploadingToCloud {
-                            HStack(spacing: 4) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.orange)
-                                Text("Upload in progress!")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                            }
-                        }
-                        Text("Exit?")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                    }
-                    
-                    Button {
-                        dlog("❌ [StatusView] Exiting app now")
-                        exit(0)
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(Color.red)
-                                .frame(width: 60, height: 60)
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 24, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    
-                    Button {
-                        withAnimation {
-                            showLocalExitConfirmation = false
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(Color.gray.opacity(0.5))
-                                .frame(width: 60, height: 60)
-                            Image(systemName: "xmark")
-                                .font(.system(size: 24, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    // Normal mode
-                    // Expand button
-                    Button {
-                        withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
-                            isMinimized = false
-                            userInteracted = true  // Mark that user has interacted
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(Color.white.opacity(0.3))
-                                .frame(width: 60, height: 60)
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 24, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    
-                    // Recording button
-                    Button {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                            if recordingManager.isRecording {
-                                recordingManager.stopRecordingManually()
-                            } else {
-                                recordingManager.startRecording()
-                            }
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(recordingManager.isRecording ? Color.red : Color.red.opacity(0.8))
-                                .frame(width: 60, height: 60)
-                            if recordingManager.isRecording {
-                                // Stop icon (square)
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(Color.white)
-                                    .frame(width: 22, height: 22)
-                            } else {
-                                // Record icon (circle)
-                                Circle()
-                                    .fill(Color.white)
-                                    .frame(width: 24, height: 24)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    
-                    // Video minimize/maximize button (only show if video streaming mode is enabled)
-                    if showVideoStatus {
-                        Button {
-                            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
-                                videoMinimized.toggle()
-                            }
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(Color.blue.opacity(0.8))
-                                    .frame(width: 60, height: 60)
-                                Image(systemName: videoMinimized ? "video.fill" : "video.slash.fill")
-                                    .font(.system(size: 24, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-
-                        // Toggle world-fixed mode for the video panel
-                        Button {
-                            videoFixed.toggle()
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(videoFixed ? Color.orange.opacity(0.8) : Color.white.opacity(0.3))
-                                    .frame(width: 60, height: 60)
-                                Image(systemName: videoFixed ? "lock.fill" : "lock.open.fill")
-                                    .font(.system(size: 24, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    
-                    // Exit button
-                    Button {
-                        dlog("🔴 [StatusView] Exit button tapped (minimized)")
-                        withAnimation {
-                            showLocalExitConfirmation = true
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(Color.red)
-                                .frame(width: 60, height: 60)
-                            Text("✕")
-                                .font(.system(size: 27, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .buttonStyle(.plain)
+            // Expand to access recording and exit controls.
+            Button {
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                    isMinimized = false
+                    userInteracted = true
+                }
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.3))
+                        .frame(width: 60, height: 60)
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(.white)
                 }
             }
-            
+            .buttonStyle(.plain)
+
             // Storage location indicator (minimal line below buttons)
             HStack(spacing: 4) {
                 if recordingManager.storageLocation == .cloud {
@@ -1020,7 +886,7 @@ struct StatusOverlay: View {
                     .font(.system(size: 16))
                     .foregroundColor(.white.opacity(0.5))
                 
-                Text("Records egocentric video and hand/head tracking. This mode requires:")
+                Text("Records camera video on the capture board and hand/head tracking on Vision Pro. Both devices must share a local network.")
                         .font(.caption)
                         .foregroundColor(.white.opacity(0.7))
                     .fixedSize(horizontal: false, vertical: true)
@@ -1028,9 +894,9 @@ struct StatusOverlay: View {
             
             // Requirements list - horizontal layout
             HStack(spacing: 12) {
-                requirementRow(number: "1", text: "Camera")
-                requirementRow(number: "2", text: "Dev Strap")
-                requirementRow(number: "3", text: "Cam Mount")
+                requirementRow(number: "1", text: "Stereo Camera")
+                requirementRow(number: "2", text: "Capture Board")
+                requirementRow(number: "3", text: "Shared LAN")
             }
             .padding(.leading, 26) // Align with text above
         }
@@ -4676,46 +4542,6 @@ struct StatusPreviewView: View {
                     .foregroundColor(.white)
             }
             
-            // Recording button (non-functional in preview)
-            ZStack {
-                Circle()
-                    .fill(Color.red.opacity(0.8))
-                    .frame(width: 60, height: 60)
-                Circle()
-                    .fill(Color.white)
-                    .frame(width: 24, height: 24)
-            }
-            
-            // Video minimize/maximize button (only show if video streaming mode is enabled)
-            if showVideoStatus {
-                ZStack {
-                    Circle()
-                        .fill(Color.blue.opacity(0.8))
-                        .frame(width: 60, height: 60)
-                    Image(systemName: "video.fill")
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-                }
-            
-                ZStack {
-                    Circle()
-                        .fill(videoFixed ? Color.orange.opacity(0.8) : Color.white.opacity(0.3))
-                        .frame(width: 60, height: 60)
-                    Image(systemName: videoFixed ? "lock.fill" : "lock.open.fill")
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-                }
-            }
-            
-            // Close button (non-functional in preview)
-            ZStack {
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 60, height: 60)
-                Text("✕")
-                    .font(.system(size: 27, weight: .bold))
-                    .foregroundColor(.white)
-            }
         }
         .padding(30)
         .background(Color.black.opacity(0.6))
